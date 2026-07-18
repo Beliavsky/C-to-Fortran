@@ -103,7 +103,9 @@ class VarInfo:
 @dataclass
 class StructDef:
     name: str
-    fields: List[Tuple[str, str]]
+    # Each field is (name, fortran_type, shape). `shape` is a Fortran extent
+    # string (e.g. "2" or "3, 3") for array fields, or None for scalars.
+    fields: List[Tuple[str, str, Optional[str]]]
 
 
 _STRUCT_TYPEDEFS: Set[str] = set()
@@ -462,12 +464,22 @@ def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
             struct = ext.type
         if not name or struct is None or not struct.decls:
             continue
-        fields: List[Tuple[str, str]] = []
+        fields: List[Tuple[str, str, Optional[str]]] = []
         for d in struct.decls or []:
             if not isinstance(d, c_ast.Decl) or not d.name:
                 continue
             ftype, _alloc = c_to_ftype(d.type)
-            fields.append((d.name, ftype))
+            dims: List[str] = []
+            type_node = d.type
+            while isinstance(type_node, c_ast.ArrayDecl):
+                if isinstance(type_node.dim, c_ast.Constant):
+                    dims.append(type_node.dim.value)
+                else:
+                    dims = []
+                    break
+                type_node = type_node.type
+            shape = ", ".join(reversed(dims)) if dims else None
+            fields.append((d.name, ftype, shape))
         out[name.lower()] = StructDef(name=name.lower(), fields=fields)
     return out
 
@@ -499,6 +511,36 @@ def collect_enum_constants(node: c_ast.Node) -> Dict[str, int]:
                 visit(child)
 
     visit(node)
+    return out
+
+
+def collect_define_constants(text: str) -> Dict[str, Tuple[str, str]]:
+    """Collect object-like ``#define NAME literal`` numeric macros.
+
+    Returns a mapping of macro name to ``(fortran_type, fortran_value)``.
+    Function-like macros and non-numeric values are ignored (they are handled
+    elsewhere or left to the C preprocessor stripping).
+    """
+    out: Dict[str, Tuple[str, str]] = {}
+    define_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$")
+    int_re = re.compile(r"^[+-]?\d+[uUlL]*$")
+    float_re = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+-]?\d+)?[fFlL]*$")
+    for line in text.splitlines():
+        m = define_re.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        value = m.group(2).strip()
+        # Skip function-like macros: `#define NAME(x) ...`.
+        if re.match(r"^\s*#\s*define\s+[A-Za-z_]\w*\s*\(", line):
+            continue
+        if int_re.match(value):
+            digits = re.sub(r"[uUlL]+$", "", value)
+            out[name] = ("integer", digits)
+        elif float_re.match(value):
+            body = re.sub(r"[fFlL]+$", "", value)
+            body = body.replace("D", "e").replace("d", "e")
+            out[name] = ("real(kind=dp)", f"{body}_dp")
     return out
 
 
@@ -601,6 +643,7 @@ class Emitter:
         array_result_funcs: Optional[Dict[str, int]] = None,
         enum_constants: Optional[Dict[str, int]] = None,
         struct_defs: Optional[Dict[str, StructDef]] = None,
+        define_constants: Optional[Dict[str, Tuple[str, str]]] = None,
     ) -> None:
         self.lines: List[str] = []
         self.indent = 0
@@ -611,6 +654,7 @@ class Emitter:
         self.array_result_funcs: Dict[str, int] = array_result_funcs or {}
         self.enum_constants: Dict[str, int] = enum_constants or {}
         self.struct_defs: Dict[str, StructDef] = struct_defs or {}
+        self.define_constants: Dict[str, Tuple[str, str]] = define_constants or {}
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
@@ -832,6 +876,8 @@ class Emitter:
             args = []
             if n.args is not None:
                 args = [self.expr(a) for a in n.args.exprs]
+            if fname in {"fabs", "fabsf", "fabsl"} and len(args) >= 1:
+                return self.simp(f"abs({args[0]})")
             if fname in {"fminf", "fmin"} and len(args) >= 2:
                 return self.simp(f"min({args[0]}, {args[1]})")
             if fname in {"fmaxf", "fmax"} and len(args) >= 2:
@@ -1117,9 +1163,16 @@ class Emitter:
             self.emit(f"{k} = {k} + 1")
             return
 
-        # Special malloc -> allocate
+        # Special malloc -> allocate. The malloc/realloc call may appear either
+        # cast to a pointer type (`(T *)malloc(...)`) or bare (C implicitly
+        # converts the `void *` result), so accept both forms.
+        malloc_fc: Optional[c_ast.FuncCall] = None
         if isinstance(st.rvalue, c_ast.Cast) and isinstance(st.rvalue.expr, c_ast.FuncCall):
-            fc = st.rvalue.expr
+            malloc_fc = st.rvalue.expr
+        elif isinstance(st.rvalue, c_ast.FuncCall):
+            malloc_fc = st.rvalue
+        if malloc_fc is not None and isinstance(malloc_fc.name, c_ast.ID) and malloc_fc.name.name in ("malloc", "realloc"):
+            fc = malloc_fc
             if isinstance(fc.name, c_ast.ID) and fc.name.name == "realloc" and fc.args is not None and len(fc.args.exprs) >= 2:
                 lhs = self.expr(st.lvalue)
                 size_arg = fc.args.exprs[1]
@@ -1379,14 +1432,17 @@ class Emitter:
                     return
                 if isinstance(st.init, c_ast.ID) and st.init.name == "NULL":
                     return
-                # Declaration-initialized malloc -> allocate
+                # Declaration-initialized malloc -> allocate (cast or bare).
+                init_fc: Optional[c_ast.FuncCall] = None
                 if isinstance(st.init, c_ast.Cast) and isinstance(st.init.expr, c_ast.FuncCall):
-                    fc = st.init.expr
-                    if isinstance(fc.name, c_ast.ID) and fc.name.name == "malloc" and fc.args is not None and fc.args.exprs:
-                        arg = fc.args.exprs[0]
-                        n = self._malloc_count_expr(arg)
-                        self.emit(f"allocate({st.name}({n}))")
-                        return
+                    init_fc = st.init.expr
+                elif isinstance(st.init, c_ast.FuncCall):
+                    init_fc = st.init
+                if init_fc is not None and isinstance(init_fc.name, c_ast.ID) and init_fc.name.name == "malloc" and init_fc.args is not None and init_fc.args.exprs:
+                    arg = init_fc.args.exprs[0]
+                    n = self._malloc_count_expr(arg)
+                    self.emit(f"allocate({st.name}({n}))")
+                    return
                 if isinstance(st.init, c_ast.FuncCall) and isinstance(st.init.name, c_ast.ID):
                     fname = st.init.name.name
                     if fname in self.array_result_funcs and st.init.args is not None:
@@ -1545,6 +1601,30 @@ class Emitter:
         raise NotImplementedError(f"Unsupported stmt: {type(st).__name__}")
 
 
+def emit_rand_helper(em: Emitter) -> None:
+    """Emit a Fortran `rand()` returning an integer in [0, RAND_MAX].
+
+    C's ``rand()`` has no direct Fortran intrinsic; approximate it with the
+    intrinsic pseudorandom generator scaled to the C ``RAND_MAX`` range.
+    """
+    em.emit("function rand() result(rand_result)")
+    em.emit("! integer pseudorandom value in [0, RAND_MAX], approximating C rand()")
+    em.emit("integer :: rand_result")
+    em.emit("real(kind=dp) :: rand_r")
+    em.emit("call random_number(rand_r)")
+    em.emit("rand_result = int(rand_r * 2147483648.0_dp)")
+    em.emit("end function rand")
+
+
+def emit_used_defines(em: Emitter, body: c_ast.Node) -> None:
+    """Emit `parameter` declarations for `#define` constants used in `body`."""
+    if not em.define_constants:
+        return
+    for name, (ftype, value) in em.define_constants.items():
+        if ast_uses_any_id(body, {name}):
+            em.emit(f"{ftype}, parameter :: {name} = {value}")
+
+
 def emit_function(
     fn: c_ast.FuncDef,
     em: Emitter,
@@ -1587,6 +1667,7 @@ def emit_function(
         em.emit("implicit none")
         for enum_name, enum_value in em.enum_constants.items():
             em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
+        emit_used_defines(em, fn.body)
 
         locals_map: Dict[str, VarInfo] = {}
         gather_decls(fn.body, locals_map)
@@ -1688,6 +1769,7 @@ def emit_function(
         em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
     for enum_name, enum_value in em.enum_constants.items():
         em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
+    emit_used_defines(em, fn.body)
 
     param_set = set(pnames)
     # params
@@ -1709,6 +1791,18 @@ def emit_function(
             else:
                 intent = "intent(in)"
         is_array_dummy = has_array_ref_of(fn.body, p.name)
+        # A non-const pointer to a struct is conventionally mutated by the
+        # callee (its members are updated in place, often via address-of-member
+        # passed to a helper). Usage scanning cannot see those indirect writes,
+        # so default such a scalar struct pointer to intent(inout).
+        if (
+            not p_const
+            and p_ptr_or_arr
+            and not is_array_dummy
+            and p_ft.lower().startswith("type(")
+            and intent == "intent(in)"
+        ):
+            intent = "intent(inout)"
         inline_doc = c_arg_comments.get(p.name.lower()) or param_comment_map.get(p.name.lower()) or arg_docline(
             p.name, p_ft, intent=intent, is_array=is_array_dummy
         )
@@ -1907,6 +2001,7 @@ def transpile_c_to_fortran(
     dp_init = "kind(1.0)" if real_prec == "single" else "kind(1.0d0)"
     struct_defs = collect_struct_typedefs(ast)
     enum_constants = collect_enum_constants(ast)
+    define_constants = collect_define_constants(text)
     global _STRUCT_TYPEDEFS
     _STRUCT_TYPEDEFS = set(struct_defs.keys())
 
@@ -1937,9 +2032,12 @@ def transpile_c_to_fortran(
         array_result_funcs=array_result_funcs,
         enum_constants=enum_constants,
         struct_defs=struct_defs,
+        define_constants=define_constants,
     )
     funcs = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name != "main"]
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
+    uses_rand = bool(collect_called_names(ast, {"rand"}))
+    main_uses_rand = any(collect_called_names(m, {"rand"}) for m in mains)
     module_proc_names: Set[str] = {e.decl.name for e in funcs}
     main_called_module_names: Set[str] = set()
     main_needed_types: Set[str] = set()
@@ -1954,12 +2052,14 @@ def transpile_c_to_fortran(
                 if tname in struct_defs:
                     main_needed_types.add(tname)
 
-    if funcs:
+    if funcs or uses_rand:
         em.emit("module xc2f_mod")
         em.emit("implicit none")
         em.emit("private")
         if mains:
             publics = sorted(set(main_called_module_names) | set(main_needed_types))
+            if main_uses_rand:
+                publics.append("rand")
         else:
             publics = sorted(module_proc_names)
         publics.extend(sorted(struct_defs.keys()))
@@ -1971,8 +2071,11 @@ def transpile_c_to_fortran(
             for sname in sorted(struct_defs.keys()):
                 sdef = struct_defs[sname]
                 em.emit(f"type :: {sdef.name}")
-                for fname, ftype in sdef.fields:
-                    em.emit(f"   {ftype} :: {fname}")
+                for fname, ftype, shape in sdef.fields:
+                    if shape:
+                        em.emit(f"   {ftype} :: {fname}({shape})")
+                    else:
+                        em.emit(f"   {ftype} :: {fname}")
                 em.emit(f"end type {sdef.name}")
                 em.emit("")
         em.emit("contains")
@@ -1985,14 +2088,20 @@ def transpile_c_to_fortran(
                 c_header_comments_by_func=c_header_comments_by_func,
             )
             em.emit("")
+        if uses_rand:
+            emit_rand_helper(em)
+            em.emit("")
         em.emit("end module xc2f_mod")
         em.emit("")
 
+    main_use_names = sorted(set(main_called_module_names) | set(main_needed_types))
+    if main_uses_rand:
+        main_use_names.append("rand")
     for ext in mains:
         emit_function(
             ext,
             em,
-            main_use_names=sorted(set(main_called_module_names) | set(main_needed_types)),
+            main_use_names=main_use_names,
             c_arg_comments_by_func=c_arg_comments_by_func,
             c_header_comments_by_func=c_header_comments_by_func,
         )

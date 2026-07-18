@@ -1236,7 +1236,10 @@ def hoist_repeated_size_calls(lines: List[str], *, min_uses: int = 3) -> List[st
             k += 1
         while k < ue:
             s = fscan.strip_comment(out[k]).strip()
-            if not s or s.startswith("!") or declish_re.match(s):
+            # Skip blanks, comments, declarations, and continuation lines of a
+            # wrapped declaration (which start with `&`) so the executable start
+            # is not mistaken for a point inside a multi-line declaration.
+            if not s or s.startswith("!") or s.startswith("&") or declish_re.match(s):
                 k += 1
                 continue
             break

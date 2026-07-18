@@ -3034,15 +3034,21 @@ def wrap_long_fortran_line(body: str, max_len: int = 80) -> Optional[List[str]]:
 
     Returns `None` when no conservative wrap point is found.
     """
-    if len(body) <= max_len:
+    # Preserve the original end-of-line marker and re-apply it to every
+    # emitted line. Continuation lines must each keep their own EOL so callers
+    # that ``"".join`` the result do not merge the physical lines together.
+    eol = "\r\n" if body.endswith("\r\n") else ("\n" if body.endswith("\n") else "")
+    core = body[: len(body) - len(eol)] if eol else body
+
+    if len(core) <= max_len:
         return [body]
-    if _is_comment_or_preproc_body(body):
+    if _is_comment_or_preproc_body(core):
         return None
 
-    indent = re.match(r"^\s*", body).group(0)
+    indent = re.match(r"^\s*", core).group(0)
     cont_indent = indent + "   "
     lines: List[str] = []
-    cur = body
+    cur = core
     first = True
 
     while len(cur) > max_len:
@@ -3061,11 +3067,11 @@ def wrap_long_fortran_line(body: str, max_len: int = 80) -> Optional[List[str]]:
         right = cur[cut:].lstrip()
         if not left or not right:
             return None
-        lines.append(f"{left} &")
+        lines.append(f"{left} &{eol}")
         cur = f"{cont_indent}& {right}"
         first = False
 
-    lines.append(cur)
+    lines.append(f"{cur}{eol}")
     return lines
 
 
@@ -5553,6 +5559,13 @@ def find_set_but_never_read_local_edits(lines: List[str]) -> DeadStoreEdits:
                 if bn in declared:
                     writes.setdefault(bn, set()).add(sln)
                     assign_stmt_line_by_var.setdefault(bn, set()).add(sln)
+                # Identifiers inside an LHS array subscript (e.g. `x(i+1)`) are
+                # reads, not writes; scan them so index variables aren't seen as
+                # unread and wrongly removed.
+                paren = lhs.find("(")
+                if paren != -1:
+                    for r in _extract_ident_reads(lhs[paren:], declared):
+                        reads.setdefault(r, set()).add(sln)
                 for r in _extract_ident_reads(rhs, declared):
                     reads.setdefault(r, set()).add(sln)
                 continue
