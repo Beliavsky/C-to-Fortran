@@ -42,6 +42,7 @@ typedef unsigned int uint32_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
 typedef long time_t;
+typedef int bool;
 typedef double complex_double;
 struct tm;
 void *malloc(size_t);
@@ -129,9 +130,16 @@ def strip_preprocessor_and_comments(text: str) -> str:
         i += 1
     s = "".join(lines)
     out = []
+    skip_cont = False
     for line in s.splitlines():
         t = line.strip()
+        # A preprocessor directive continued with a trailing backslash carries
+        # over to following physical lines; drop those continuation lines too.
+        if skip_cont:
+            skip_cont = line.rstrip().endswith("\\")
+            continue
         if t.startswith("#"):
+            skip_cont = line.rstrip().endswith("\\")
             continue
         if "//" in line:
             line = line.split("//", 1)[0]
@@ -142,8 +150,13 @@ def strip_preprocessor_and_comments(text: str) -> str:
 def strip_preprocessor_only(text: str) -> str:
     """Remove preprocessor lines but keep comments."""
     out = []
+    skip_cont = False
     for line in text.splitlines():
+        if skip_cont:
+            skip_cont = line.rstrip().endswith("\\")
+            continue
         if line.strip().startswith("#"):
+            skip_cont = line.rstrip().endswith("\\")
             continue
         out.append(line)
     return "\n".join(out)
@@ -544,6 +557,64 @@ def collect_define_constants(text: str) -> Dict[str, Tuple[str, str]]:
     return out
 
 
+def _split_top_level_commas(s: str) -> List[str]:
+    """Split on commas not nested inside brackets, quotes."""
+    parts: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_s = False
+    in_d = False
+    for ch in s:
+        if ch == '"' and not in_s:
+            in_d = not in_d
+        elif ch == "'" and not in_d:
+            in_s = not in_s
+        if not in_s and not in_d:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append("".join(cur))
+                cur = []
+                continue
+        cur.append(ch)
+    if cur:
+        parts.append("".join(cur))
+    return parts
+
+
+def collect_generic_macros(text: str) -> Dict[str, Dict[str, str]]:
+    """Collect ``#define NAME(x) _Generic(...)`` type-selection macros.
+
+    Returns name -> {c_type_or_'default': result_token}, where result_token is
+    the (Fortran-compatible) literal to emit for that type.
+    """
+    out: Dict[str, Dict[str, str]] = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^\s*#\s*define\b", line):
+            full = line
+            while full.rstrip().endswith("\\") and i + 1 < len(lines):
+                full = full.rstrip()[:-1] + " " + lines[i + 1]
+                i += 1
+            m = re.match(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s*\(\s*[A-Za-z_]\w*\s*\)\s*(.+)$", full)
+            if m is not None and "_Generic" in m.group(2):
+                gm = re.search(r"_Generic\s*\((.*)\)\s*$", m.group(2).strip())
+                if gm is not None:
+                    mapping: Dict[str, str] = {}
+                    for entry in _split_top_level_commas(gm.group(1))[1:]:
+                        if ":" in entry:
+                            ty, res = entry.split(":", 1)
+                            mapping[ty.strip().lower()] = res.strip()
+                    if mapping:
+                        out[m.group(1).lower()] = mapping
+        i += 1
+    return out
+
+
 def get_id_name(node: c_ast.Node) -> Optional[str]:
     if isinstance(node, c_ast.ID):
         return node.name
@@ -644,6 +715,7 @@ class Emitter:
         enum_constants: Optional[Dict[str, int]] = None,
         struct_defs: Optional[Dict[str, StructDef]] = None,
         define_constants: Optional[Dict[str, Tuple[str, str]]] = None,
+        generic_macros: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> None:
         self.lines: List[str] = []
         self.indent = 0
@@ -655,11 +727,13 @@ class Emitter:
         self.enum_constants: Dict[str, int] = enum_constants or {}
         self.struct_defs: Dict[str, StructDef] = struct_defs or {}
         self.define_constants: Dict[str, Tuple[str, str]] = define_constants or {}
+        self.generic_macros: Dict[str, Dict[str, str]] = generic_macros or {}
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
         self.pointer_like_names: Set[str] = set()
         self.var_infos: Dict[str, VarInfo] = {}
+        self.label_map: Dict[str, int] = {}
 
     def _is_sizeof_node(self, n: c_ast.Node) -> bool:
         return isinstance(n, c_ast.UnaryOp) and n.op == "sizeof"
@@ -841,7 +915,8 @@ class Emitter:
             vals = n.exprs or []
             return "[" + ", ".join(self.expr(v) for v in vals) + "]"
         if isinstance(n, c_ast.TernaryOp):
-            return f"merge({self.expr(n.iftrue)}, {self.expr(n.iffalse)}, {self.expr(n.cond)})"
+            t_expr, f_expr = self._pad_char_literals(self.expr(n.iftrue), self.expr(n.iffalse))
+            return f"merge({t_expr}, {f_expr}, {self.cond_expr(n.cond)})"
         if isinstance(n, c_ast.ArrayRef):
             # C multidimensional arrays are row-major. Reverse both dimensions
             # and subscripts in Fortran so a flat initializer retains its order.
@@ -873,6 +948,15 @@ class Emitter:
             return f"{name}({self.expr(idx)}+1)"
         if isinstance(n, c_ast.FuncCall):
             fname = self.expr(n.name)
+            # _Generic type-selection macro: pick the branch for the argument's
+            # static type at translation time.
+            if isinstance(n.name, c_ast.ID) and n.name.name.lower() in self.generic_macros:
+                mapping = self.generic_macros[n.name.name.lower()]
+                if n.args is not None and len(n.args.exprs) == 1:
+                    ctype = self._arg_c_type(n.args.exprs[0])
+                    result = mapping.get(ctype or "", None) or mapping.get("default")
+                    if result is not None:
+                        return result
             args = []
             if n.args is not None:
                 args = [self.expr(a) for a in n.args.exprs]
@@ -904,7 +988,121 @@ class Emitter:
             base = self.expr(n.name)
             field = self.expr(n.field)
             return f"{base}%{field}"
+        if isinstance(n, c_ast.CompoundLiteral):
+            tnode = n.type.type if isinstance(n.type, c_ast.Typename) else n.type
+            ftype, _ = c_to_ftype(tnode)
+            m = re.match(r"^type\(([^)]+)\)$", ftype, re.IGNORECASE)
+            if m is not None and isinstance(n.init, c_ast.InitList):
+                return self._struct_constructor(m.group(1), n.init)
+            if isinstance(n.init, c_ast.InitList):
+                return self.expr(n.init)
         raise NotImplementedError(f"Unsupported expr: {type(n).__name__}")
+
+    @staticmethod
+    def _printf_edit_descriptor(conv: str, width: str, prec: str) -> Optional[str]:
+        """Map a single C printf conversion to a Fortran edit descriptor."""
+        w = width if (width and width != "*") else ""
+        p = prec if (prec and prec != "*") else ""
+        c = conv.lower()
+        if c in ("d", "i", "u"):
+            return f"i{w}" if w else "i0"
+        if c == "x":
+            return f"z{w}" if w else "z0"
+        if c == "o":
+            return f"o{w}" if w else "o0"
+        if c == "f":
+            pp = p or "6"
+            return f"f{w}.{pp}" if w else f"f0.{pp}"
+        if c == "e":
+            pp = p or "6"
+            return f"es{w}.{pp}" if w else f"es0.{pp}"
+        if c == "g":
+            pp = p or "6"
+            return f"g{w}.{pp}" if w else "g0"
+        if c == "a":  # C hexadecimal float; approximate.
+            pp = p or "6"
+            return f"es{w}.{pp}" if w else f"es0.{pp}"
+        if c == "s":
+            return f"a{w}" if w else "a"
+        if c == "c":
+            return "a1"
+        return None
+
+    _PRINTF_CONV_RE = re.compile(
+        r"%([-+ 0#]*)(\d+|\*)?(?:\.(\d+|\*))?(?:hh|h|ll|l|j|z|t|L)*([diouxXeEfFgGaAcs%])"
+    )
+
+    def _translate_printf(self, fmt_literal: str, vals: List[c_ast.Node]) -> Optional[List[str]]:
+        """Translate a C printf format + arguments to a Fortran write statement.
+
+        Returns the emitted line(s), or ``None`` if the format cannot be
+        represented (so the caller can fall back). Literal text (labels) is
+        preserved and each conversion becomes a separate edit descriptor, so
+        fields never run together.
+        """
+        text = _decode_c_string_literal(fmt_literal)
+        if text is None:
+            return None
+        advance = True
+        if text.endswith("\n"):
+            text = text[:-1]
+        else:
+            advance = False
+
+        fmt_items: List[str] = []
+        arg_exprs: List[str] = []
+        lit: List[str] = []
+
+        def flush_lit() -> None:
+            if lit:
+                fmt_items.append('"' + "".join(lit).replace('"', '""') + '"')
+                lit.clear()
+
+        i = 0
+        vi = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "\n":
+                flush_lit()
+                fmt_items.append("/")
+                i += 1
+                continue
+            if ch == "%":
+                m = self._PRINTF_CONV_RE.match(text, i)
+                if m is None:
+                    lit.append(ch)
+                    i += 1
+                    continue
+                flags, width, prec, conv = m.groups()
+                i = m.end()
+                if conv == "%":
+                    lit.append("%")
+                    continue
+                if vi >= len(vals):
+                    return None
+                desc = self._printf_edit_descriptor(conv, width or "", prec or "")
+                if desc is None:
+                    return None
+                flush_lit()
+                fmt_items.append(desc)
+                arg_exprs.append(self.expr(vals[vi]))
+                vi += 1
+                continue
+            lit.append(ch)
+            i += 1
+        flush_lit()
+
+        if vi != len(vals):
+            return None  # argument count mismatch; let caller fall back.
+
+        adv = "" if advance else ', advance="no"'
+        if not fmt_items:
+            # Pure newline (or empty) format: emit a blank record.
+            return ["write(*,*)"] if advance else []
+        fmt = "'(" + ", ".join(fmt_items) + ")'"
+        if arg_exprs:
+            return [f"write(*, {fmt}{adv}) {', '.join(arg_exprs)}"]
+        return [f"write(*, {fmt}{adv})"]
 
     def emit_printf(self, fc: c_ast.FuncCall) -> bool:
         args = fc.args.exprs if fc.args is not None else []
@@ -947,6 +1145,14 @@ class Emitter:
         if fmt == "min=%g max=%g\\n" and len(vals) == 2:
             self.emit(f'write(*,\'("min=",g0," max=",g0)\') {self.expr(vals[0])}, {self.expr(vals[1])}')
             return True
+        # General translation: preserve literal labels and keep each field as a
+        # separate edit descriptor so outputs never run together.
+        translated = self._translate_printf(fmt_node.value, vals)
+        if translated is not None:
+            for line in translated:
+                self.emit(line)
+            return True
+
         # Fallback for unsupported formats: preserve data output list-directed.
         self.emit(_xc2f_added_comment(f'approximated printf format: "{fmt}"'))
         if vals:
@@ -1144,15 +1350,118 @@ class Emitter:
         self.indent -= 3
         self.emit("end do")
 
+    def _emit_incdec_value(self, target: str, u: c_ast.UnaryOp) -> None:
+        """Emit ``target = x++`` / ``++x`` style increment/decrement as a value."""
+        v = self.expr(u.expr)
+        step = "+ 1" if u.op in ("p++", "++") else "- 1"
+        if u.op in ("p++", "p--"):  # postfix: value is the old contents
+            self.emit(f"{target} = {v}")
+            self.emit(f"{v} = {v} {step}")
+        else:  # prefix: value is the updated contents
+            self.emit(f"{v} = {v} {step}")
+            self.emit(f"{target} = {v}")
+
+    @staticmethod
+    def _ftype_to_c_type(ftype: str) -> Optional[str]:
+        """Map a Fortran type back to the C type name used in _Generic macros."""
+        t = ftype.lower()
+        if t.startswith("integer"):
+            return "int"
+        if "kind=sp" in t:
+            return "float"
+        if "kind=dp" in t or "real64" in t or t.startswith("real"):
+            return "double"
+        return None
+
+    def _arg_c_type(self, arg: c_ast.Node) -> Optional[str]:
+        """Best-effort C type of an argument for _Generic resolution."""
+        if isinstance(arg, c_ast.ID):
+            info = self.var_infos.get(arg.name.lower())
+            if info is not None:
+                return self._ftype_to_c_type(info.ftype)
+        if isinstance(arg, c_ast.Constant):
+            if arg.type in ("int", "long", "unsigned int", "long long"):
+                return "int"
+            if arg.type in ("double", "float"):
+                return "double"
+        return None
+
+    @staticmethod
+    def _pad_char_literals(a: str, b: str) -> Tuple[str, str]:
+        """Pad two Fortran character literals to equal length for `merge`."""
+        ma = re.match(r'^"(.*)"$', a, re.DOTALL)
+        mb = re.match(r'^"(.*)"$', b, re.DOTALL)
+        if ma is not None and mb is not None:
+            width = max(len(ma.group(1)), len(mb.group(1)))
+            return f'"{ma.group(1).ljust(width)}"', f'"{mb.group(1).ljust(width)}"'
+        return a, b
+
+    @staticmethod
+    def _zero_literal(ftype: str) -> str:
+        t = ftype.lower()
+        if t.startswith("integer"):
+            return "0"
+        if t.startswith("complex"):
+            return "(0.0_dp, 0.0_dp)"
+        if t.startswith("real"):
+            return "0.0_dp"
+        if t.startswith("logical"):
+            return ".false."
+        return "0"
+
+    def _struct_constructor(self, type_name: str, init: c_ast.InitList) -> str:
+        """Build a Fortran structure constructor from a C struct initializer.
+
+        Handles both positional (`{1, 2}`) and designated (`{.a = 1}`) forms;
+        designated fields are placed in declaration order and any omitted field
+        is filled with a type-appropriate zero.
+        """
+        exprs = init.exprs or []
+        sdef = self.struct_defs.get(type_name.lower())
+        is_designated = any(isinstance(e, c_ast.NamedInitializer) for e in exprs)
+        if not is_designated or sdef is None:
+            values = ", ".join(self.expr(v) for v in exprs)
+            return f"{type_name}({values})"
+        field_vals: Dict[str, str] = {}
+        for e in exprs:
+            if isinstance(e, c_ast.NamedInitializer) and e.name and isinstance(e.name[0], c_ast.ID):
+                field_vals[e.name[0].name.lower()] = self.expr(e.expr)
+        ordered = [
+            field_vals.get(fname.lower(), self._zero_literal(ftype))
+            for fname, ftype, _shape in sdef.fields
+        ]
+        return f"{type_name}({', '.join(ordered)})"
+
     def emit_assignment(self, st: c_ast.Assignment, *, array_result_name: Optional[str] = None) -> None:
+        if st.op == "=" and isinstance(st.rvalue, c_ast.UnaryOp) and st.rvalue.op in ("p++", "p--", "++", "--"):
+            self._emit_incdec_value(self.expr(st.lvalue), st.rvalue)
+            return
         if st.op != "=":
             lhs = self.expr(st.lvalue)
             rhs = self.simp(self.expr(st.rvalue))
+            if st.op == "%=":
+                self.emit(f"{lhs} = mod({lhs}, {rhs})")
+                return
             op_map = {"+=": "+", "-=": "-", "*=": "*", "/=": "/"}
             bop = op_map.get(st.op)
             if bop is None:
                 raise NotImplementedError(f"Unsupported assignment op {st.op}")
             self.emit(f"{lhs} = {lhs} {bop} {rhs}")
+            return
+
+        # Chained assignment: `a = b = c = expr;` -> emit inner chain first,
+        # then copy the inner target into the outer target.
+        if isinstance(st.rvalue, c_ast.Assignment):
+            self.emit_stmt(st.rvalue)
+            self.emit(f"{self.expr(st.lvalue)} = {self.expr(st.rvalue.lvalue)}")
+            return
+
+        # Comma expression as a value: `x = (y = 3, y + 4);` -> evaluate the
+        # side-effecting prefix statements, then assign the final expression.
+        if isinstance(st.rvalue, c_ast.ExprList) and st.rvalue.exprs:
+            for pre in st.rvalue.exprs[:-1]:
+                self.emit_stmt(pre)
+            self.emit(f"{self.expr(st.lvalue)} = {self.simp(self.expr(st.rvalue.exprs[-1]))}")
             return
 
         # Special: a[k++] = expr;
@@ -1425,9 +1734,12 @@ class Emitter:
                 if isinstance(st.init, c_ast.InitList) and info is not None:
                     struct_match = re.match(r"^type\(([^)]+)\)$", info.ftype, re.IGNORECASE)
                     if struct_match and struct_match.group(1).lower() in self.struct_defs:
-                        values = ", ".join(self.expr(value) for value in (st.init.exprs or []))
-                        self.emit(f"{st.name} = {struct_match.group(1)}({values})")
+                        ctor = self._struct_constructor(struct_match.group(1), st.init)
+                        self.emit(f"{st.name} = {ctor}")
                         return
+                if isinstance(st.init, c_ast.UnaryOp) and st.init.op in ("p++", "p--", "++", "--"):
+                    self._emit_incdec_value(st.name, st.init)
+                    return
                 if isinstance(st.init, c_ast.Constant) and st.init.value == "NULL":
                     return
                 if isinstance(st.init, c_ast.ID) and st.init.name == "NULL":
@@ -1534,6 +1846,15 @@ class Emitter:
             self.indent -= 3
             self.emit("end do")
             return
+        if isinstance(st, c_ast.DoWhile):
+            # C do-while runs the body once before testing the condition.
+            self.emit("do")
+            self.indent += 3
+            self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
+            self.emit(f"if (.not. ({self.cond_expr(st.cond)})) exit")
+            self.indent -= 3
+            self.emit("end do")
+            return
         if isinstance(st, c_ast.FuncCall):
             if isinstance(st.name, c_ast.ID) and st.name.name == "printf":
                 self.emit_printf(st)
@@ -1598,6 +1919,22 @@ class Emitter:
         if isinstance(st, c_ast.Continue):
             self.emit("cycle")
             return
+        if isinstance(st, c_ast.Label):
+            num = self.label_map.get(st.name)
+            if num is None:
+                num = 1000 + len(self.label_map)
+                self.label_map[st.name] = num
+            # A numeric-labelled CONTINUE lets any statement carry a target.
+            self.emit(f"{num} continue")
+            self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
+            return
+        if isinstance(st, c_ast.Goto):
+            num = self.label_map.get(st.name)
+            if num is None:
+                num = 1000 + len(self.label_map)
+                self.label_map[st.name] = num
+            self.emit(f"go to {num}")
+            return
         raise NotImplementedError(f"Unsupported stmt: {type(st).__name__}")
 
 
@@ -1637,6 +1974,7 @@ def emit_function(
     fdecl = decl.type
     if not isinstance(fdecl, c_ast.FuncDecl):
         raise NotImplementedError("Expected FuncDecl")
+    em.label_map = {}
     name = decl.name
     c_arg_comments = (c_arg_comments_by_func or {}).get(name.lower(), {})
     c_header_comment = (c_header_comments_by_func or {}).get(name.lower())
@@ -1871,6 +2209,21 @@ def collect_called_names(node: c_ast.Node, names: Set[str]) -> Set[str]:
     return found
 
 
+def collect_struct_type_uses(node: c_ast.Node, struct_names: Set[str]) -> Set[str]:
+    """Collect struct type names used via compound literals in a subtree."""
+    found: Set[str] = set()
+    if isinstance(node, c_ast.CompoundLiteral):
+        tnode = node.type.type if isinstance(node.type, c_ast.Typename) else node.type
+        ftype, _ = c_to_ftype(tnode)
+        m = re.match(r"^type\(([^)]+)\)$", ftype, re.IGNORECASE)
+        if m is not None and m.group(1).lower() in struct_names:
+            found.add(m.group(1).lower())
+    for _k, child in node.children():
+        if isinstance(child, c_ast.Node):
+            found |= collect_struct_type_uses(child, struct_names)
+    return found
+
+
 def ast_uses_any_id(node: c_ast.Node, names: Set[str]) -> bool:
     """True if subtree references any identifier in `names`."""
     if isinstance(node, c_ast.ID) and node.name in names:
@@ -2002,6 +2355,7 @@ def transpile_c_to_fortran(
     struct_defs = collect_struct_typedefs(ast)
     enum_constants = collect_enum_constants(ast)
     define_constants = collect_define_constants(text)
+    generic_macros = collect_generic_macros(text)
     global _STRUCT_TYPEDEFS
     _STRUCT_TYPEDEFS = set(struct_defs.keys())
 
@@ -2033,6 +2387,7 @@ def transpile_c_to_fortran(
         enum_constants=enum_constants,
         struct_defs=struct_defs,
         define_constants=define_constants,
+        generic_macros=generic_macros,
     )
     funcs = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name != "main"]
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
@@ -2043,6 +2398,9 @@ def transpile_c_to_fortran(
     main_needed_types: Set[str] = set()
     for m in mains:
         main_called_module_names.update(collect_called_names(m, module_proc_names))
+        # Struct types referenced by main via compound literals / constructors
+        # (not just declared variables) must also be imported.
+        main_needed_types |= collect_struct_type_uses(m.body, set(struct_defs.keys()))
         lmap: Dict[str, VarInfo] = {}
         gather_decls(m.body, lmap)
         for _n, info in lmap.items():
@@ -2052,7 +2410,9 @@ def transpile_c_to_fortran(
                 if tname in struct_defs:
                     main_needed_types.add(tname)
 
-    if funcs or uses_rand:
+    # Emit a module whenever there are module procedures, a rand() helper, or
+    # struct type definitions (which main and other units share).
+    if funcs or uses_rand or struct_defs:
         em.emit("module xc2f_mod")
         em.emit("implicit none")
         em.emit("private")
@@ -2078,19 +2438,20 @@ def transpile_c_to_fortran(
                         em.emit(f"   {ftype} :: {fname}")
                 em.emit(f"end type {sdef.name}")
                 em.emit("")
-        em.emit("contains")
-        em.emit("")
-        for ext in funcs:
-            emit_function(
-                ext,
-                em,
-                c_arg_comments_by_func=c_arg_comments_by_func,
-                c_header_comments_by_func=c_header_comments_by_func,
-            )
+        if funcs or uses_rand:
+            em.emit("contains")
             em.emit("")
-        if uses_rand:
-            emit_rand_helper(em)
-            em.emit("")
+            for ext in funcs:
+                emit_function(
+                    ext,
+                    em,
+                    c_arg_comments_by_func=c_arg_comments_by_func,
+                    c_header_comments_by_func=c_header_comments_by_func,
+                )
+                em.emit("")
+            if uses_rand:
+                emit_rand_helper(em)
+                em.emit("")
         em.emit("end module xc2f_mod")
         em.emit("")
 
