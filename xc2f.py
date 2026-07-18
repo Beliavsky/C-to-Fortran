@@ -42,6 +42,7 @@ typedef unsigned int uint32_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
 typedef long time_t;
+typedef double complex_double;
 struct tm;
 void *malloc(size_t);
 void *realloc(void *, size_t);
@@ -56,6 +57,8 @@ int fclose(FILE *);
 int fprintf(FILE *, const char *, ...);
 int fscanf(FILE *, const char *, ...);
 int printf(const char *, ...);
+double creal(complex_double);
+double cimag(complex_double);
 """.strip()
 
 DEFAULT_GFORTRAN_FLAGS = [
@@ -94,6 +97,7 @@ def _prepend_origin_comment(fsrc: str, sources: List[Path]) -> str:
 class VarInfo:
     ftype: str
     alloc: bool = False
+    shape: Optional[Tuple[str, ...]] = None
 
 
 @dataclass
@@ -160,6 +164,11 @@ def normalize_fortran_d_exponents(text: str) -> str:
         repl,
         text,
     )
+
+
+def normalize_c_complex_types(text: str) -> str:
+    """Replace C99 complex spellings with parser-friendly typedef names."""
+    return re.sub(r"\bdouble\s+(?:_Complex|complex)\b", "complex_double", text)
 
 
 def _decode_c_string_literal(literal: str) -> Optional[str]:
@@ -376,6 +385,8 @@ def c_to_ftype(type_decl: c_ast.Node) -> Tuple[str, bool]:
             return "character(len=*)", False
         if "double" in names:
             return "real(kind=dp)", alloc
+        if "complex_double" in names:
+            return "complex(kind=dp)", alloc
         if "float" in names:
             return "real(kind=sp)", alloc
         if len(names) == 1 and names[0] in _STRUCT_TYPEDEFS:
@@ -414,33 +425,80 @@ def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
             return
         ftype, alloc = c_to_ftype(node.type)
         if node.name:
-            out[node.name] = VarInfo(ftype=ftype, alloc=alloc)
+            dims: List[str] = []
+            type_node = node.type
+            while isinstance(type_node, c_ast.ArrayDecl):
+                if type_node.dim is None:
+                    dims = []
+                    break
+                if isinstance(type_node.dim, c_ast.Constant):
+                    dims.append(type_node.dim.value)
+                else:
+                    dims = []
+                    break
+                type_node = type_node.type
+            out[node.name] = VarInfo(
+                ftype=ftype,
+                alloc=alloc,
+                shape=tuple(reversed(dims)) if dims else None,
+            )
     for _, child in node.children():
         gather_decls(child, out)
 
 
 def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
-    """Collect `typedef struct { ... } name_t;` definitions."""
+    """Collect typedef and named ``struct`` definitions."""
     out: Dict[str, StructDef] = {}
     for ext in ast.ext:
-        if not isinstance(ext, c_ast.Typedef):
-            continue
-        t = ext.type
-        if not isinstance(t, c_ast.TypeDecl):
-            continue
-        s = t.type
-        if not isinstance(s, c_ast.Struct):
-            continue
-        tname = ext.name
-        if not tname:
+        name: Optional[str] = None
+        struct: Optional[c_ast.Struct] = None
+        if isinstance(ext, c_ast.Typedef):
+            type_node = ext.type
+            if isinstance(type_node, c_ast.TypeDecl) and isinstance(type_node.type, c_ast.Struct):
+                name = ext.name
+                struct = type_node.type
+        elif isinstance(ext, c_ast.Decl) and isinstance(ext.type, c_ast.Struct):
+            name = ext.type.name
+            struct = ext.type
+        if not name or struct is None or not struct.decls:
             continue
         fields: List[Tuple[str, str]] = []
-        for d in s.decls or []:
+        for d in struct.decls or []:
             if not isinstance(d, c_ast.Decl) or not d.name:
                 continue
             ftype, _alloc = c_to_ftype(d.type)
             fields.append((d.name, ftype))
-        out[tname.lower()] = StructDef(name=tname.lower(), fields=fields)
+        out[name.lower()] = StructDef(name=name.lower(), fields=fields)
+    return out
+
+
+def collect_enum_constants(node: c_ast.Node) -> Dict[str, int]:
+    """Collect integer values from C enums with literal or implicit values."""
+    out: Dict[str, int] = {}
+
+    def visit(current: c_ast.Node) -> None:
+        if isinstance(current, c_ast.Enum) and current.values is not None:
+            next_value = 0
+            for enumerator in current.values.enumerators or []:
+                if enumerator.value is not None:
+                    value_node = enumerator.value
+                    sign = 1
+                    if isinstance(value_node, c_ast.UnaryOp) and value_node.op == "-":
+                        sign = -1
+                        value_node = value_node.expr
+                    if not isinstance(value_node, c_ast.Constant):
+                        raise NotImplementedError("Only literal enum values are supported")
+                    try:
+                        next_value = sign * int(value_node.value, 0)
+                    except ValueError as exc:
+                        raise NotImplementedError("Only integer enum values are supported") from exc
+                out[enumerator.name] = next_value
+                next_value += 1
+        for _name, child in current.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(node)
     return out
 
 
@@ -541,6 +599,8 @@ class Emitter:
         comment_map: Optional[Dict[int, List[str]]] = None,
         line_offset: int = 0,
         array_result_funcs: Optional[Dict[str, int]] = None,
+        enum_constants: Optional[Dict[str, int]] = None,
+        struct_defs: Optional[Dict[str, StructDef]] = None,
     ) -> None:
         self.lines: List[str] = []
         self.indent = 0
@@ -549,6 +609,8 @@ class Emitter:
         self.line_offset = line_offset
         self.comment_cursor = 1
         self.array_result_funcs: Dict[str, int] = array_result_funcs or {}
+        self.enum_constants: Dict[str, int] = enum_constants or {}
+        self.struct_defs: Dict[str, StructDef] = struct_defs or {}
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
@@ -655,6 +717,8 @@ class Emitter:
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
             if n.name in {"INFINITY", "HUGE_VAL"}:
                 return "ieee_value(0.0_dp, ieee_positive_inf)"
+            if n.name == "I":
+                return "(0.0_dp, 1.0_dp)"
             if self.array_result_name is not None and self.array_result_tmp_alias is not None:
                 if n.name == self.array_result_tmp_alias:
                     return self.array_result_name
@@ -735,6 +799,17 @@ class Emitter:
         if isinstance(n, c_ast.TernaryOp):
             return f"merge({self.expr(n.iftrue)}, {self.expr(n.iffalse)}, {self.expr(n.cond)})"
         if isinstance(n, c_ast.ArrayRef):
+            # C multidimensional arrays are row-major. Reverse both dimensions
+            # and subscripts in Fortran so a flat initializer retains its order.
+            indices: List[c_ast.Node] = []
+            base_node: c_ast.Node = n
+            while isinstance(base_node, c_ast.ArrayRef):
+                indices.append(base_node.subscript)
+                base_node = base_node.name
+            if len(indices) > 1:
+                base = self.expr(base_node)
+                rendered = [f"{self.expr(index)}+1" for index in indices]
+                return f"{base}({', '.join(rendered)})"
             idx = n.subscript
             # C pointer indexing: (a + off)[i] => a(off + i + 1)
             if isinstance(n.name, c_ast.BinaryOp) and n.name.op == "+":
@@ -768,6 +843,10 @@ class Emitter:
                 return self.simp(f"sqrt(real({a0}, kind=dp))")
             if fname == "floor":
                 return self.simp(f"floor({args[0]})")
+            if fname == "creal":
+                return self.simp(f"real({args[0]}, kind=dp)")
+            if fname == "cimag":
+                return self.simp(f"aimag({args[0]})")
             if fname == "printf":
                 return "__PRINTF__"
             if fname in self.array_result_funcs:
@@ -838,8 +917,19 @@ class Emitter:
         if info.alloc:
             self.emit(f"{info.ftype}, allocatable :: {name}(:)")
             self.arrays_1d.add(name)
+        elif info.shape:
+            self.emit(f"{info.ftype} :: {name}({', '.join(info.shape)})")
         else:
             self.emit(f"{info.ftype} :: {name}")
+
+    def _flatten_init_list(self, init: c_ast.InitList) -> List[c_ast.Node]:
+        values: List[c_ast.Node] = []
+        for item in init.exprs or []:
+            if isinstance(item, c_ast.InitList):
+                values.extend(self._flatten_init_list(item))
+            else:
+                values.append(item)
+        return values
 
     def emit_decl_grouped(self, decls: Dict[str, VarInfo], params: Set[str], ret_name: Optional[str]) -> None:
         """Emit declarations with non-allocatable entities first, then allocatables."""
@@ -1199,6 +1289,57 @@ class Emitter:
             self.indent -= 3
         self.emit("end if")
 
+    def _contains_break(self, node: c_ast.Node) -> bool:
+        if isinstance(node, c_ast.Break):
+            return True
+        return any(
+            isinstance(child, c_ast.Node) and self._contains_break(child)
+            for _name, child in node.children()
+        )
+
+    def emit_switch(
+        self,
+        st: c_ast.Switch,
+        ret_name: Optional[str],
+        array_result_name: Optional[str] = None,
+    ) -> None:
+        """Lower a conservative, non-fallthrough C switch to SELECT CASE."""
+        if not isinstance(st.stmt, c_ast.Compound):
+            raise NotImplementedError("Switch body must be a compound statement")
+        arms = list(st.stmt.block_items or [])
+        if not arms or not all(isinstance(arm, (c_ast.Case, c_ast.Default)) for arm in arms):
+            raise NotImplementedError("Only direct case/default switch arms are supported")
+
+        normalized: List[Tuple[c_ast.Node, List[c_ast.Node]]] = []
+        for index, arm in enumerate(arms):
+            statements = list(arm.stmts or [])
+            terminal_break = bool(statements and isinstance(statements[-1], c_ast.Break))
+            if terminal_break:
+                statements.pop()
+            if index < len(arms) - 1 and not terminal_break:
+                raise NotImplementedError("C switch fallthrough is not supported")
+            if any(self._contains_break(stmt) for stmt in statements):
+                raise NotImplementedError("Conditional switch breaks are not supported")
+            normalized.append((arm, statements))
+
+        self.emit(f"select case ({self.expr(st.cond)})")
+        self.indent += 3
+        for arm, statements in normalized:
+            if isinstance(arm, c_ast.Case):
+                self.emit(f"case ({self.expr(arm.expr)})")
+            else:
+                self.emit("case default")
+            self.indent += 3
+            for statement in statements:
+                self.emit_stmt(
+                    statement,
+                    ret_name=ret_name,
+                    array_result_name=array_result_name,
+                )
+            self.indent -= 3
+        self.indent -= 3
+        self.emit("end select")
+
     def emit_stmt(
         self,
         st: c_ast.Node,
@@ -1221,6 +1362,19 @@ class Emitter:
         if isinstance(st, c_ast.Decl):
             # declarations already hoisted
             if st.init is not None:
+                info = self.var_infos.get((st.name or "").lower())
+                if isinstance(st.init, c_ast.InitList) and info is not None and info.shape:
+                    flat_values = self._flatten_init_list(st.init)
+                    values = ", ".join(self.expr(value) for value in flat_values)
+                    shape = ", ".join(info.shape)
+                    self.emit(f"{st.name} = reshape([{values}], [{shape}])")
+                    return
+                if isinstance(st.init, c_ast.InitList) and info is not None:
+                    struct_match = re.match(r"^type\(([^)]+)\)$", info.ftype, re.IGNORECASE)
+                    if struct_match and struct_match.group(1).lower() in self.struct_defs:
+                        values = ", ".join(self.expr(value) for value in (st.init.exprs or []))
+                        self.emit(f"{st.name} = {struct_match.group(1)}({values})")
+                        return
                 if isinstance(st.init, c_ast.Constant) and st.init.value == "NULL":
                     return
                 if isinstance(st.init, c_ast.ID) and st.init.name == "NULL":
@@ -1281,6 +1435,9 @@ class Emitter:
             return
         if isinstance(st, c_ast.If):
             self.emit_if(st, ret_name=ret_name, array_result_name=array_result_name)
+            return
+        if isinstance(st, c_ast.Switch):
+            self.emit_switch(st, ret_name=ret_name, array_result_name=array_result_name)
             return
         if isinstance(st, c_ast.For):
             self.emit_for(st)
@@ -1364,11 +1521,11 @@ class Emitter:
             self.emit(f"call {self.expr(st.name)}({', '.join(self.expr(a) for a in (st.args.exprs if st.args else []))})")
             return
         if isinstance(st, c_ast.UnaryOp):
-            if st.op == "p++":
+            if st.op in {"p++", "++"}:
                 v = self.expr(st.expr)
                 self.emit(f"{v} = {v} + 1")
                 return
-            if st.op == "p--":
+            if st.op in {"p--", "--"}:
                 v = self.expr(st.expr)
                 self.emit(f"{v} = {v} - 1")
                 return
@@ -1418,6 +1575,7 @@ def emit_function(
     if fdecl.args is not None:
         params = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)]
     need_ieee_consts = ast_uses_any_id(fn.body, {"NAN", "INFINITY", "HUGE_VAL"})
+    is_recursive = name in collect_called_names(fn.body, {name})
 
     if name == "main":
         em.emit("program main")
@@ -1427,6 +1585,8 @@ def emit_function(
         if need_ieee_consts:
             em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
         em.emit("implicit none")
+        for enum_name, enum_value in em.enum_constants.items():
+            em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
 
         locals_map: Dict[str, VarInfo] = {}
         gather_decls(fn.body, locals_map)
@@ -1457,16 +1617,17 @@ def emit_function(
 
     result_name_for_body: Optional[str] = None
     result_decl_ftype: Optional[str] = None
+    recursive_prefix = "recursive " if is_recursive else ""
     if out_idx is not None:
-        em.emit(f"function {name}({', '.join(pnames)}) result({out_param_name})")
+        em.emit(f"{recursive_prefix}function {name}({', '.join(pnames)}) result({out_param_name})")
         unit_kind = "function"
         result_name_for_body = out_param_name
     elif ret_ftype.lower() == "void":
-        em.emit(f"subroutine {name}({', '.join(pnames)})")
+        em.emit(f"{recursive_prefix}subroutine {name}({', '.join(pnames)})")
         unit_kind = "subroutine"
     else:
         result_name_for_body = f"{name}_result"
-        em.emit(f"function {name}({', '.join(pnames)}) result({result_name_for_body})")
+        em.emit(f"{recursive_prefix}function {name}({', '.join(pnames)}) result({result_name_for_body})")
         unit_kind = "function"
         result_decl_ftype = ret_ftype
     em.emit(f"! {proc_docline(name, unit_kind)}")
@@ -1525,6 +1686,8 @@ def emit_function(
     em.emit("use, intrinsic :: iso_fortran_env, only: real64")
     if need_ieee_consts:
         em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
+    for enum_name, enum_value in em.enum_constants.items():
+        em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
 
     param_set = set(pnames)
     # params
@@ -1735,12 +1898,15 @@ def transpile_c_to_fortran(
     comments = extract_preserved_comments(no_pp)
     c_arg_comments_by_func = extract_c_function_arg_comments(no_pp)
     c_header_comments_by_func = extract_c_function_header_comments(no_pp)
-    src = normalize_fortran_d_exponents(strip_preprocessor_and_comments(text))
+    src = normalize_c_complex_types(
+        normalize_fortran_d_exponents(strip_preprocessor_and_comments(text))
+    )
     parser = c_parser.CParser()
     ast = parser.parse(PRELUDE + "\n" + src)
     real_prec = _detect_c_real_precision(src)
     dp_init = "kind(1.0)" if real_prec == "single" else "kind(1.0d0)"
     struct_defs = collect_struct_typedefs(ast)
+    enum_constants = collect_enum_constants(ast)
     global _STRUCT_TYPEDEFS
     _STRUCT_TYPEDEFS = set(struct_defs.keys())
 
@@ -1765,7 +1931,13 @@ def transpile_c_to_fortran(
                 array_result_funcs[decl.name] = idx
                 break
 
-    em = Emitter(comment_map=comments, line_offset=line_offset, array_result_funcs=array_result_funcs)
+    em = Emitter(
+        comment_map=comments,
+        line_offset=line_offset,
+        array_result_funcs=array_result_funcs,
+        enum_constants=enum_constants,
+        struct_defs=struct_defs,
+    )
     funcs = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name != "main"]
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
     module_proc_names: Set[str] = {e.decl.name for e in funcs}
@@ -2808,7 +2980,9 @@ def inline_single_use_temp_assignments(lines: List[str]) -> List[str]:
                 i += 1
                 continue
             m0 = occ_j[0]
-            new_code_j = f"{code_j[:m0.start()]}{rhs}{code_j[m0.end():]}"
+            # Parenthesize the substituted expression so operator precedence is
+            # preserved (notably `(a + bi) * (c + di)` complex expressions).
+            new_code_j = f"{code_j[:m0.start()]}({rhs}){code_j[m0.end():]}"
             eol_j = xunused.get_eol(out[j]) or "\n"
             out[j] = f"{new_code_j}{comment_j}{eol_j}"
             # drop assignment line

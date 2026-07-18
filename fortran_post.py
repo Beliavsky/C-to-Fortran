@@ -222,10 +222,62 @@ def tighten_unary_minus_literal_spacing(lines: List[str]) -> List[str]:
         r"(^|[=(,\[*/+\-]\s*)-\s+"
         r"((?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+\-]?\d+)?(?:_[A-Za-z][A-Za-z0-9_]*)?)"
     )
+
+    def _sub_outside_quotes(text: str) -> str:
+        out_parts: List[str] = []
+        cur: List[str] = []
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(text) and text[i + 1] == "'":
+                    cur.append(text[i : i + 2])
+                    i += 2
+                    continue
+                if in_single:
+                    cur.append(ch)
+                    out_parts.append("".join(cur))
+                    cur = []
+                    in_single = False
+                else:
+                    code_seg = "".join(cur)
+                    out_parts.append(pat.sub(lambda m: f"{m.group(1)}-{m.group(2)}", code_seg))
+                    cur = [ch]
+                    in_single = True
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                if in_double and i + 1 < len(text) and text[i + 1] == '"':
+                    cur.append(text[i : i + 2])
+                    i += 2
+                    continue
+                if in_double:
+                    cur.append(ch)
+                    out_parts.append("".join(cur))
+                    cur = []
+                    in_double = False
+                else:
+                    code_seg = "".join(cur)
+                    out_parts.append(pat.sub(lambda m: f"{m.group(1)}-{m.group(2)}", code_seg))
+                    cur = [ch]
+                    in_double = True
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+        tail = "".join(cur)
+        if in_single or in_double:
+            out_parts.append(tail)
+        else:
+            out_parts.append(pat.sub(lambda m: f"{m.group(1)}-{m.group(2)}", tail))
+        return "".join(out_parts)
+
     for raw in lines:
         code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
         eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
-        code = pat.sub(lambda m: f"{m.group(1)}-{m.group(2)}", code)
+        code = _sub_outside_quotes(code)
         out.append(f"{code}{comment}{eol}")
     return out
 

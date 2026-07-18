@@ -4361,6 +4361,7 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
     )
     do_var_re = re.compile(r"^\s*do\s+([a-z_]\w*)\s*=", re.IGNORECASE)
     asn_re = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
+    call_re = re.compile(r"^\s*call\s+[a-z_]\w*\s*\((.*)\)\s*$", re.IGNORECASE)
 
     i = 0
     while i < len(out):
@@ -4410,6 +4411,7 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
         assign_count: Dict[str, int] = {}
         assign_rhs: Dict[str, str] = {}
         do_assigned: Set[str] = set()
+        call_actuals: Set[str] = set()
         for ei in range(exec_start, u_end):
             code, _comment = _split_code_comment(out[ei].rstrip("\r\n"))
             s = code.strip()
@@ -4418,6 +4420,15 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
             md = do_var_re.match(s)
             if md:
                 do_assigned.add(md.group(1).lower())
+            mc = call_re.match(s)
+            if mc:
+                for actual in _split_top_level_commas(mc.group(1)):
+                    # A scalar passed to a procedure may correspond to an
+                    # INTENT(OUT/INOUT) dummy. Keep it as a variable unless
+                    # interprocedural intent information proves otherwise.
+                    ma_actual = re.fullmatch(r"\s*([a-z_]\w*)\s*", actual, re.IGNORECASE)
+                    if ma_actual:
+                        call_actuals.add(ma_actual.group(1).lower())
             ma = asn_re.match(s)
             if ma:
                 name = ma.group(1).lower()
@@ -4428,6 +4439,8 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
         promote: Dict[str, str] = {}
         for name, (_decl_i, _spec, _indent) in decl_info.items():
             if do_assigned.__contains__(name):
+                continue
+            if name in call_actuals:
                 continue
             if assign_count.get(name, 0) != 1:
                 continue
@@ -5341,6 +5354,15 @@ def _replace_identifiers_outside_strings(code: str, mapping: Dict[str, str]) -> 
                 j += 1
             tok = code[i:j]
             repl = mapping.get(tok.lower())
+            # RESULT(...) in a function header is syntax, not a reference to
+            # a user variable named "result" that may also need renaming.
+            if (
+                tok.lower() == "result"
+                and repl is not None
+                and re.match(r"\s*\(", code[j:])
+                and re.search(r"\bfunction\b", code[:i], re.IGNORECASE)
+            ):
+                repl = None
             out.append(repl if repl is not None else tok)
             i = j
             continue
