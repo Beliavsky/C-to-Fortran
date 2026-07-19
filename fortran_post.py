@@ -124,6 +124,87 @@ def ensure_blank_line_between_program_units(lines: List[str]) -> List[str]:
     return out
 
 
+def collapse_consecutive_blank_lines(lines: List[str]) -> List[str]:
+    """Keep at most one consecutive whitespace-only line."""
+    out: List[str] = []
+    previous_was_blank = False
+    for line in lines:
+        is_blank = not line.strip()
+        if is_blank and previous_was_blank:
+            continue
+        out.append(line)
+        previous_was_blank = is_blank
+    return out
+
+
+def remove_parentheses_around_variable_references(lines: List[str]) -> List[str]:
+    """Remove grouping parentheses around scalar names and component chains.
+
+    Required call, indexing, and control-statement parentheses are retained.
+    String literals and comments are not modified.
+    """
+    reference_re = re.compile(
+        r"\(\s*([A-Za-z_][A-Za-z0-9_]*(?:%[A-Za-z_][A-Za-z0-9_]*)*)\s*\)"
+    )
+
+    def _rewrite_code_segment(segment: str) -> str:
+        text = segment
+        while True:
+            changed = False
+            for match in reference_re.finditer(text):
+                before = text[: match.start()].rstrip()
+                after = text[match.end() :].lstrip()
+                previous = before[-1] if before else ""
+                following = after[0] if after else ""
+
+                # A preceding name/component/closing delimiter means these are
+                # call or indexing parentheses, for example size(x) or a(i).
+                if previous and (previous.isalnum() or previous in "_%])"):
+                    continue
+                # Do not concatenate the unwrapped reference with another name.
+                if following and (following.isalnum() or following == "_"):
+                    continue
+
+                text = text[: match.start()] + match.group(1) + text[match.end() :]
+                changed = True
+                break
+            if not changed:
+                return text
+
+    def _rewrite_outside_strings(code: str) -> str:
+        parts: List[str] = []
+        code_start = 0
+        i = 0
+        while i < len(code):
+            quote = code[i]
+            if quote not in "'\"":
+                i += 1
+                continue
+            parts.append(_rewrite_code_segment(code[code_start:i]))
+            literal_start = i
+            i += 1
+            while i < len(code):
+                if code[i] != quote:
+                    i += 1
+                    continue
+                if i + 1 < len(code) and code[i + 1] == quote:
+                    i += 2
+                    continue
+                i += 1
+                break
+            parts.append(code[literal_start:i])
+            code_start = i
+        parts.append(_rewrite_code_segment(code[code_start:]))
+        return "".join(parts)
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_rewrite_outside_strings(code)}{comment}{eol}")
+    return out
+
+
 def simplify_norm2_patterns(lines: List[str]) -> List[str]:
     """Rewrite simple Euclidean norm patterns to `norm2(...)`.
 
@@ -1462,7 +1543,13 @@ def normalize_shifted_index_loops(lines: List[str]) -> List[str]:
             break
 
         # Check loop body usage of ivar.
-        pat_plus = re.compile(rf"\b{re.escape(ivar)}\s*\+\s*1\b", re.IGNORECASE)
+        # The offset must be the complete integer token 1. Without the final
+        # guard, `i + 1.0_dp` also matches through the `1`, producing corrupt
+        # text such as `i.0_dp`.
+        pat_plus = re.compile(
+            rf"\b{re.escape(ivar)}\s*\+\s*1(?![\w.])",
+            re.IGNORECASE,
+        )
         pat_id = re.compile(rf"\b{re.escape(ivar)}\b", re.IGNORECASE)
         saw_plus = False
         safe = True

@@ -4175,6 +4175,14 @@ def transpile_c_to_fortran(
     out_text = "".join(fpost.ensure_blank_line_between_module_procedures(out_text.splitlines(keepends=True)))
     out_text = "".join(fpost.ensure_blank_line_between_program_units(out_text.splitlines(keepends=True)))
     out_text = "".join(fscan.ensure_space_before_inline_comments(out_text.splitlines(keepends=True)))
+    out_text = "".join(
+        fpost.remove_parentheses_around_variable_references(
+            out_text.splitlines(keepends=True)
+        )
+    )
+    out_text = "".join(
+        fpost.collapse_consecutive_blank_lines(out_text.splitlines(keepends=True))
+    )
     out_text = _normalize_kind_intrinsic_literals(out_text)
     return out_text
 
@@ -5297,6 +5305,12 @@ def main() -> int:
             post_lines_loc = fpost.ensure_blank_line_between_module_procedures(post_lines_loc)
             post_lines_loc = _remove_arg_style_doc_comments(post_lines_loc)
             fsrc_loc = _normalize_kind_intrinsic_literals("".join(post_lines_loc))
+        final_lines_loc = fsrc_loc.splitlines(keepends=True)
+        final_lines_loc = fpost.remove_parentheses_around_variable_references(
+            final_lines_loc
+        )
+        final_lines_loc = fpost.collapse_consecutive_blank_lines(final_lines_loc)
+        fsrc_loc = "".join(final_lines_loc)
         return fsrc_loc
 
     if args.mode == "combined":
