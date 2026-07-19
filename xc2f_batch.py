@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from xc2f import DEFAULT_GFORTRAN_FLAGS
+from xc2f import gfortran_flags
 
 
 @dataclass
@@ -161,6 +161,7 @@ def _run_both_pipeline(
     transpile_flags: List[str],
     run_diff: bool,
     time_both: bool,
+    debug: bool = False,
 ) -> Tuple[bool, int, str]:
     """Build both languages before running either executable."""
     c_exe = fortran_source.with_name(f"{fortran_source.stem}.orig.exe")
@@ -198,7 +199,7 @@ def _run_both_pipeline(
         [
             "gfortran",
             str(fortran_source),
-            *DEFAULT_GFORTRAN_FLAGS,
+            *gfortran_flags(debug=debug),
             "-o",
             str(fortran_exe),
         ],
@@ -243,6 +244,8 @@ def main() -> int:
     ap.add_argument("--array", action="store_true", help="Forward --array to xc2f.py.")
     ap.add_argument("--array-inline", action="store_true", help="Forward --array-inline to xc2f.py.")
     ap.add_argument("--inline-temp", action="store_true", help="Forward --inline-temp to xc2f.py.")
+    ap.add_argument("--no-pure", action="store_true", help="Disable automatic PURE promotion in xc2f.py.")
+    ap.add_argument("--debug", action="store_true", help="Compile Fortran with full debugging and traceback options.")
     ap.add_argument("--tee", action="store_true", help="Forward --tee to xc2f.py.")
     ap.add_argument("--tee-orig", action="store_true", help="Forward --tee-orig to xc2f.py.")
     ap.add_argument("--tee-both", action="store_true", help="Forward --tee-both to xc2f.py.")
@@ -319,6 +322,11 @@ def main() -> int:
         if args.inline_temp:
             cmd.append("--inline-temp")
             transpile_flags.append("--inline-temp")
+        if args.no_pure:
+            cmd.append("--no-pure")
+            transpile_flags.append("--no-pure")
+        if args.debug:
+            cmd.append("--debug")
         if args.tee:
             cmd.append("--tee")
             transpile_flags.append("--tee")
@@ -355,6 +363,7 @@ def main() -> int:
                 transpile_flags=transpile_flags,
                 run_diff=args.run_diff,
                 time_both=args.time_both,
+                debug=args.debug,
             )
             status = "PASS" if ok else "FAIL"
             if not ok:
