@@ -116,6 +116,9 @@ class StructDef:
 
 _STRUCT_TYPEDEFS: Set[str] = set()
 
+# Struct name -> flexible-array-member field name (C `double data[];`).
+_STRUCT_FLEX_MEMBERS: Dict[str, str] = {}
+
 # Common <limits.h>/<stdint.h> constants lowered to literal values.
 _C_LIMIT_CONSTANTS: Dict[str, str] = {
     "INT_MAX": "2147483647",
@@ -427,7 +430,7 @@ def c_to_ftype(type_decl: c_ast.Node) -> Tuple[str, bool]:
         if len(names) == 1 and names[0] in _STRUCT_TYPEDEFS:
             return f"type({names[0]})", alloc
         return "integer", alloc
-    if isinstance(node, c_ast.Struct):
+    if isinstance(node, (c_ast.Struct, c_ast.Union)):
         sname = (node.name or "").lower()
         if sname:
             return f"type({sname})", alloc
@@ -579,6 +582,11 @@ def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
             # `int x[] = {a, b, c}`: infer the extent from the initializer.
             if unsized_array and isinstance(node.init, c_ast.InitList):
                 dims = [str(len(node.init.exprs or []))]
+            # A pointer to a struct with a flexible array member is one object
+            # whose payload lives in the allocatable component: keep it scalar.
+            mflex = re.match(r"^type\(([^)]+)\)$", ftype, re.IGNORECASE)
+            if alloc and mflex is not None and mflex.group(1).lower() in _STRUCT_FLEX_MEMBERS:
+                alloc = False
             out[node.name] = VarInfo(
                 ftype=ftype,
                 alloc=alloc,
@@ -589,17 +597,23 @@ def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
 
 
 def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
-    """Collect typedef and named ``struct`` definitions."""
+    """Collect typedef and named ``struct``/``union`` definitions.
+
+    A flexible array member (`double data[];`) is recorded with shape ":" and
+    becomes an allocatable component. Its name per struct goes into
+    ``_STRUCT_FLEX_MEMBERS``.
+    """
     out: Dict[str, StructDef] = {}
+    _STRUCT_FLEX_MEMBERS.clear()
     for ext in ast.ext:
         name: Optional[str] = None
-        struct: Optional[c_ast.Struct] = None
+        struct: Optional[c_ast.Node] = None
         if isinstance(ext, c_ast.Typedef):
             type_node = ext.type
-            if isinstance(type_node, c_ast.TypeDecl) and isinstance(type_node.type, c_ast.Struct):
+            if isinstance(type_node, c_ast.TypeDecl) and isinstance(type_node.type, (c_ast.Struct, c_ast.Union)):
                 name = ext.name
                 struct = type_node.type
-        elif isinstance(ext, c_ast.Decl) and isinstance(ext.type, c_ast.Struct):
+        elif isinstance(ext, c_ast.Decl) and isinstance(ext.type, (c_ast.Struct, c_ast.Union)):
             name = ext.type.name
             struct = ext.type
         if not name or struct is None or not struct.decls:
@@ -609,6 +623,11 @@ def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
             if not isinstance(d, c_ast.Decl) or not d.name:
                 continue
             ftype, _alloc = c_to_ftype(d.type)
+            if isinstance(d.type, c_ast.ArrayDecl) and d.type.dim is None:
+                # Flexible array member -> allocatable component.
+                fields.append((d.name, ftype, ":"))
+                _STRUCT_FLEX_MEMBERS[name.lower()] = d.name
+                continue
             dims: List[str] = []
             type_node = d.type
             while isinstance(type_node, c_ast.ArrayDecl):
@@ -819,6 +838,16 @@ def collect_generic_macros(text: str) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def _subtree_has_funccall(node: c_ast.Node) -> bool:
+    """True when the expression subtree contains any function call."""
+    if isinstance(node, c_ast.FuncCall):
+        return True
+    for _k, child in node.children():
+        if isinstance(child, c_ast.Node) and _subtree_has_funccall(child):
+            return True
+    return False
+
+
 def get_id_name(node: c_ast.Node) -> Optional[str]:
     if isinstance(node, c_ast.ID):
         return node.name
@@ -936,6 +965,17 @@ class Emitter:
         # Names of scalar C strings in the current unit: indexing them uses
         # substrings and '\0' comparisons become length checks.
         self.char_string_names: Set[str] = set()
+        # Per-unit identifier renames (e.g. a #define constant whose name
+        # collides case-insensitively with a local in case-insensitive Fortran).
+        self.id_rename: Dict[str, str] = {}
+        # Name of C main's argv parameter; argv[i] lowers to argv_value(i).
+        self.argv_name: Optional[str] = None
+        # (function name, param index) -> module function whose interface the
+        # function-pointer parameter uses, e.g. procedure(square) :: f.
+        self.func_ptr_ifaces: Dict[Tuple[str, int], str] = {}
+        # C pointer aliases folded away, e.g. `tmp = realloc(x, ...)` makes
+        # tmp an alias of x (lowercase key -> target name).
+        self.alias_map: Dict[str, str] = {}
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
@@ -1066,6 +1106,24 @@ class Emitter:
                 out.append(self.expr(a))
         return out
 
+    def _rename_ids_in_text(self, txt: str) -> str:
+        """Apply per-unit identifier renames to already-rendered text."""
+        for old, new in self.id_rename.items():
+            txt = re.sub(rf"\b{re.escape(old)}\b", new, txt)
+        return txt
+
+    def _flex_member_for(self, var_name: Optional[str]) -> Optional[str]:
+        """Flexible-array-member name when var is a struct that carries one."""
+        if not var_name:
+            return None
+        info = self.var_infos.get(var_name.lower())
+        if info is None:
+            return None
+        m = re.match(r"^type\(([^)]+)\)$", info.ftype, re.IGNORECASE)
+        if m is None:
+            return None
+        return _STRUCT_FLEX_MEMBERS.get(m.group(1).lower())
+
     def _is_pointer_like_id(self, n: c_ast.Node) -> bool:
         return isinstance(n, c_ast.ID) and n.name.lower() in self.pointer_like_names
 
@@ -1154,7 +1212,9 @@ class Emitter:
             if self.array_result_name is not None and self.array_result_tmp_alias is not None:
                 if n.name == self.array_result_tmp_alias:
                     return self.array_result_name
-            return n.name
+            if n.name.lower() in self.alias_map:
+                return self.alias_map[n.name.lower()]
+            return self.id_rename.get(n.name, n.name)
         if isinstance(n, c_ast.Cast):
             target, _ = c_to_ftype(n.to_type)
             inner = self.expr(n.expr)
@@ -1251,6 +1311,14 @@ class Emitter:
             t_expr, f_expr = self._pad_char_literals(self.expr(n.iftrue), self.expr(n.iffalse))
             return f"merge({t_expr}, {f_expr}, {self.cond_expr(n.cond)})"
         if isinstance(n, c_ast.ArrayRef):
+            # argv[i] -> command-line argument i (positions align: both models
+            # use 0 for the command name).
+            if (
+                self.argv_name is not None
+                and isinstance(n.name, c_ast.ID)
+                and n.name.name.lower() == self.argv_name
+            ):
+                return f"argv_value({self.expr(n.subscript)})"
             # Indexing a scalar C string reads one character: use a substring.
             if isinstance(n.name, c_ast.ID) and n.name.name.lower() in self.char_string_names:
                 base = n.name.name
@@ -1541,7 +1609,8 @@ class Emitter:
             self.emit(f"{info.ftype}, allocatable :: {name}(:)")
             self.arrays_1d.add(name)
         elif info.shape:
-            self.emit(f"{info.ftype} :: {name}({', '.join(info.shape)})")
+            dims = self._rename_ids_in_text(", ".join(info.shape))
+            self.emit(f"{info.ftype} :: {name}({dims})")
         else:
             self.emit(f"{info.ftype} :: {name}")
 
@@ -1822,6 +1891,22 @@ class Emitter:
             ]
         return f"{type_name}({', '.join(ordered)})"
 
+    def _emit_realloc_grow(self, lhs: str, fc: c_ast.FuncCall) -> None:
+        """Emit allocatable growth (move_alloc) for a C realloc of `lhs`."""
+        size_arg = fc.args.exprs[1]
+        n = self._malloc_count_expr(size_arg)
+        vinfo = self.var_infos.get(lhs.lower())
+        tmp_name = f"{lhs}_tmp"
+        elem_type = vinfo.ftype if vinfo is not None else "real(kind=dp)"
+        self.emit("block")
+        self.indent += 3
+        self.emit(f"{elem_type}, allocatable :: {tmp_name}(:)")
+        self.emit(f"allocate({tmp_name}({n}))")
+        self.emit(f"if (allocated({lhs})) {tmp_name}(1:min(size({lhs}), {n})) = {lhs}(1:min(size({lhs}), {n}))")
+        self.emit(f"call move_alloc({tmp_name}, {lhs})")
+        self.indent -= 3
+        self.emit("end block")
+
     def _emit_fopen(self, lhs: str, fc: c_ast.FuncCall) -> bool:
         """Emit `open(newunit=...)` for a C fopen call. Returns True if emitted."""
         args = fc.args.exprs if fc.args is not None else []
@@ -1841,6 +1926,10 @@ class Emitter:
         if st.op == "=" and isinstance(st.rvalue, c_ast.UnaryOp) and st.rvalue.op in ("p++", "p--", "++", "--"):
             self._emit_incdec_value(self.expr(st.lvalue), st.rvalue)
             return
+        # `x = tmp` where tmp aliases x collapses to a no-op.
+        if st.op == "=" and isinstance(st.lvalue, c_ast.ID) and isinstance(st.rvalue, c_ast.ID):
+            if self.expr(st.lvalue).lower() == self.expr(st.rvalue).lower():
+                return
         if st.op != "=":
             lhs = self.expr(st.lvalue)
             rhs = self.simp(self.expr(st.rvalue))
@@ -1895,20 +1984,7 @@ class Emitter:
                 self.emit(f"{lhs} = 0")
                 return
             if isinstance(fc.name, c_ast.ID) and fc.name.name == "realloc" and fc.args is not None and len(fc.args.exprs) >= 2:
-                lhs = self.expr(st.lvalue)
-                size_arg = fc.args.exprs[1]
-                n = self._malloc_count_expr(size_arg)
-                vinfo = self.var_infos.get(lhs.lower())
-                tmp_name = f"{lhs}_tmp"
-                elem_type = vinfo.ftype if vinfo is not None else "real(kind=dp)"
-                self.emit("block")
-                self.indent += 3
-                self.emit(f"{elem_type}, allocatable :: {tmp_name}(:)")
-                self.emit(f"allocate({tmp_name}({n}))")
-                self.emit(f"if (allocated({lhs})) {tmp_name}(1:min(size({lhs}), {n})) = {lhs}(1:min(size({lhs}), {n}))")
-                self.emit(f"call move_alloc({tmp_name}, {lhs})")
-                self.indent -= 3
-                self.emit("end block")
+                self._emit_realloc_grow(self.expr(st.lvalue), fc)
                 return
             if isinstance(fc.name, c_ast.ID) and fc.name.name == "malloc" and fc.args is not None and fc.args.exprs:
                 arg = fc.args.exprs[0]
@@ -2066,6 +2142,35 @@ class Emitter:
             self.indent -= 3
             self.emit("end block")
             return
+        # Short-circuit && / || whose right operand calls a function: C must
+        # not evaluate the call when the left operand decides the result, so
+        # build the condition stepwise with a guarded logical temporary.
+        if (
+            isinstance(st.cond, c_ast.BinaryOp)
+            and st.cond.op in ("&&", "||")
+            and _subtree_has_funccall(st.cond.right)
+        ):
+            self.emit("block")
+            self.indent += 3
+            self.emit("logical :: cond_sc")
+            self.emit(f"cond_sc = {self.cond_expr(st.cond.left)}")
+            if st.cond.op == "&&":
+                self.emit(f"if (cond_sc) cond_sc = {self.cond_expr(st.cond.right)}")
+            else:
+                self.emit(f"if (.not. cond_sc) cond_sc = {self.cond_expr(st.cond.right)}")
+            self.emit("if (cond_sc) then")
+            self.indent += 3
+            self.emit_stmt(st.iftrue, ret_name=ret_name, array_result_name=array_result_name)
+            self.indent -= 3
+            if st.iffalse is not None:
+                self.emit("else")
+                self.indent += 3
+                self.emit_stmt(st.iffalse, ret_name=ret_name, array_result_name=array_result_name)
+                self.indent -= 3
+            self.emit("end if")
+            self.indent -= 3
+            self.emit("end block")
+            return
         # suppress C pointer/null checks that are not needed after signature lowering
         if isinstance(st.cond, c_ast.BinaryOp) and st.cond.op in ("==", "!="):
             l_is_null = isinstance(st.cond.left, c_ast.ID) and st.cond.left.name == "NULL"
@@ -2181,8 +2286,12 @@ class Emitter:
                     flat_values = self._flatten_init_list(st.init)
                     real_target = info.ftype.lower().startswith("real")
                     values = ", ".join(self._init_elem_expr(value, real_target) for value in flat_values)
-                    shape = ", ".join(info.shape)
-                    if len(info.shape) == 1:
+                    shape = self._rename_ids_in_text(", ".join(info.shape))
+                    if len(flat_values) == 1 and (len(info.shape) > 1 or info.shape[0] != "1"):
+                        # C `= {0}` / `= {{0}}` zero-fills the whole array:
+                        # broadcast the single value.
+                        self.emit(f"{st.name} = {values}")
+                    elif len(info.shape) == 1:
                         self.emit(f"{st.name} = [{values}]")
                     else:
                         self.emit(f"{st.name} = reshape([{values}], [{shape}])")
@@ -2206,8 +2315,28 @@ class Emitter:
                     init_fc = st.init.expr
                 elif isinstance(st.init, c_ast.FuncCall):
                     init_fc = st.init
+                if (
+                    st.name
+                    and st.name.lower() in self.alias_map
+                    and init_fc is not None
+                    and isinstance(init_fc.name, c_ast.ID)
+                    and init_fc.name.name == "realloc"
+                    and init_fc.args is not None
+                    and len(init_fc.args.exprs) >= 2
+                ):
+                    # `T *tmp = realloc(x, n)`: grow x in place; tmp aliases x.
+                    self._emit_realloc_grow(self.alias_map[st.name.lower()], init_fc)
+                    return
                 if init_fc is not None and isinstance(init_fc.name, c_ast.ID) and init_fc.name.name == "malloc" and init_fc.args is not None and init_fc.args.exprs:
                     arg = init_fc.args.exprs[0]
+                    flex = self._flex_member_for(st.name)
+                    if flex is not None:
+                        # malloc(sizeof(*v) + n*sizeof(elem)): the extra bytes
+                        # size the flexible member; allocate that component.
+                        count_node = arg.right if isinstance(arg, c_ast.BinaryOp) and arg.op == "+" else arg
+                        n = self._malloc_count_expr(count_node)
+                        self.emit(f"allocate({st.name}%{flex}({n}))")
+                        return
                     n = self._malloc_count_expr(arg)
                     self.emit(f"allocate({st.name}({n}))")
                     return
@@ -2338,6 +2467,13 @@ class Emitter:
                 else:
                     self.emit("write(*,*)")
                 return
+            if isinstance(st.name, c_ast.ID) and st.name.name in ("memset", "memcpy", "memmove"):
+                # memset(dst, v, n) fills with v; memcpy(dst, src, n) copies.
+                # Either way the second argument is the whole-array RHS here.
+                args = st.args.exprs if st.args is not None else []
+                if len(args) == 3:
+                    self.emit(f"{self.expr(args[0])} = {self.expr(args[1])}")
+                    return
             if isinstance(st.name, c_ast.ID) and st.name.name in ("strcat", "strcpy"):
                 args = st.args.exprs if st.args is not None else []
                 if len(args) == 2:
@@ -2396,6 +2532,12 @@ class Emitter:
                 if len(args) == 1:
                     v = self.expr(args[0])
                     if v.lower() in self.auto_alloc_assigned:
+                        return
+                    flex = self._flex_member_for(v)
+                    if flex is not None:
+                        # The struct itself is a scalar; only its flexible
+                        # member holds an allocation.
+                        self.emit(f"if (allocated({v}%{flex})) deallocate({v}%{flex})")
                         return
                     self.emit(f"if (allocated({v})) deallocate({v})")
                 return
@@ -2459,13 +2601,68 @@ def emit_rand_helper(em: Emitter) -> None:
     em.emit("end function rand")
 
 
-def emit_used_defines(em: Emitter, body: c_ast.Node) -> None:
-    """Emit `parameter` declarations for `#define` constants used in `body`."""
+def _register_realloc_aliases(em: Emitter, body: c_ast.Node, locals_map: Dict[str, VarInfo]) -> None:
+    """Fold `T *tmp = realloc(x, ...)` into a growth of x with tmp aliasing x.
+
+    The aliased local is dropped from the declaration set; references to it
+    resolve to the realloc target, and `x = tmp` collapses to a no-op.
+    """
+    def visit(node: c_ast.Node) -> None:
+        if isinstance(node, c_ast.Decl) and node.name and node.init is not None:
+            init = node.init
+            if isinstance(init, c_ast.Cast):
+                init = init.expr
+            if (
+                isinstance(init, c_ast.FuncCall)
+                and isinstance(init.name, c_ast.ID)
+                and init.name.name == "realloc"
+                and init.args is not None
+                and init.args.exprs
+                and isinstance(init.args.exprs[0], c_ast.ID)
+            ):
+                target = init.args.exprs[0].name
+                if node.name in locals_map and target.lower() != node.name.lower():
+                    em.alias_map[node.name.lower()] = target
+                    locals_map.pop(node.name, None)
+        for _k, child in node.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(body)
+
+
+def emit_argv_helper(em: Emitter) -> None:
+    """Emit argv_value(pos): the pos-th command-line argument as a string."""
+    em.emit("function argv_value(pos) result(argv_value_result)")
+    em.emit("! command-line argument at position pos (0 is the command name)")
+    em.emit("integer, intent(in) :: pos")
+    em.emit("character(len=:), allocatable :: argv_value_result")
+    em.emit("integer :: arg_len")
+    em.emit("call get_command_argument(pos, length=arg_len)")
+    em.emit("allocate(character(len=arg_len) :: argv_value_result)")
+    em.emit("call get_command_argument(pos, value=argv_value_result)")
+    em.emit("end function argv_value")
+
+
+def emit_used_defines(em: Emitter, body: c_ast.Node, taken: Optional[Set[str]] = None) -> None:
+    """Emit `parameter` declarations for `#define` constants used in `body`.
+
+    C is case-sensitive, so `#define K` and a local `k` can coexist; Fortran is
+    not, so the parameter is renamed on a case-insensitive collision.
+    """
     if not em.define_constants:
         return
+    taken_low = {t.lower() for t in (taken or set())}
     for name, (ftype, value) in em.define_constants.items():
-        if ast_uses_any_id(body, {name}):
-            em.emit(f"{ftype}, parameter :: {name} = {value}")
+        if not ast_uses_any_id(body, {name}):
+            continue
+        out_name = name
+        if name.lower() in taken_low:
+            out_name = f"{name}_const"
+            while out_name.lower() in taken_low:
+                out_name += "_"
+            em.id_rename[name] = out_name
+        em.emit(f"{ftype}, parameter :: {out_name} = {value}")
 
 
 def emit_function(
@@ -2511,10 +2708,24 @@ def emit_function(
         em.emit("implicit none")
         for enum_name, enum_value in em.enum_constants.items():
             em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
-        emit_used_defines(em, fn.body)
 
         locals_map: Dict[str, VarInfo] = {}
         gather_decls(fn.body, locals_map)
+        _register_realloc_aliases(em, fn.body, locals_map)
+        # C main(argc, argv): argc maps onto command_argument_count()+1 (the
+        # command name is argument 0 in both models) and argv[i] onto the
+        # argv_value() helper.
+        argc_assign: Optional[str] = None
+        for p in params:
+            if not p.name or not ast_uses_any_id(fn.body, {p.name}):
+                continue
+            p_ft, _ = c_to_ftype(p.type)
+            if p_ft == "integer" and not type_is_ptr_or_array(p.type):
+                locals_map[p.name] = VarInfo(ftype="integer")
+                argc_assign = f"{p.name} = command_argument_count() + 1"
+            elif _classify_char_decl(p.type) == "array":
+                em.argv_name = p.name.lower()
+        emit_used_defines(em, fn.body, taken=set(locals_map.keys()))
         em.var_infos = {k.lower(): v for k, v in locals_map.items()}
         for n, info in locals_map.items():
             if info.char_string:
@@ -2525,10 +2736,15 @@ def emit_function(
                 em.pointer_like_names.add(n.lower())
         em.indent = 0
         em.emit_decl_grouped(locals_map, params=set(), ret_name=None)
+        if argc_assign is not None:
+            em.emit(argc_assign)
         em.emit_stmt(fn.body, ret_name=None)
         em.emit("end program main")
         em.pointer_like_names.clear()
         em.char_string_names.clear()
+        em.id_rename = {}
+        em.argv_name = None
+        em.alias_map = {}
         em.var_infos = {}
         return
 
@@ -2621,13 +2837,24 @@ def emit_function(
         em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
     for enum_name, enum_value in em.enum_constants.items():
         em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
-    emit_used_defines(em, fn.body)
+    _fn_locals: Dict[str, VarInfo] = {}
+    gather_decls(fn.body, _fn_locals)
+    emit_used_defines(
+        em, fn.body, taken=set(_fn_locals.keys()) | {p.name for p in params if p.name}
+    )
 
     param_set = set(pnames)
     # params
     for idx, p in enumerate(params):
         if out_idx is not None and idx == out_idx:
             continue
+        if isinstance(p.type, c_ast.PtrDecl) and isinstance(p.type.type, c_ast.FuncDecl):
+            iface = em.func_ptr_ifaces.get((name, idx))
+            if iface is not None:
+                # C function-pointer parameter: a dummy procedure with the
+                # interface of a function actually passed at some call site.
+                em.emit(f"procedure({iface}) :: {p.name}")
+                continue
         p_ft, p_alloc = c_to_ftype(p.type)
         p_ptr_or_arr = type_is_ptr_or_array(p.type)
         p_const = type_has_const(p.type)
@@ -2636,7 +2863,7 @@ def emit_function(
         else:
             has_read, has_write = _scan_dummy_usage(fn.body, p.name)
             first_read, first_write = _dummy_first_read_write_line(fn.body, p.name)
-            if has_write and (not has_read or (first_write is not None and (first_read is None or first_write <= first_read))):
+            if has_write and (not has_read or (first_write is not None and (first_read is None or first_write < first_read))):
                 intent = "intent(out)"
             elif has_write:
                 intent = "intent(inout)"
@@ -2679,6 +2906,7 @@ def emit_function(
     # locals
     locals_map: Dict[str, VarInfo] = {}
     gather_decls(fn.body, locals_map)
+    _register_realloc_aliases(em, fn.body, locals_map)
     em.var_infos = {k.lower(): v for k, v in locals_map.items()}
     for n, info in locals_map.items():
         if info.char_string:
@@ -2719,7 +2947,45 @@ def emit_function(
     em.array_result_tmp_alias = None
     em.pointer_like_names.clear()
     em.char_string_names.clear()
+    em.id_rename = {}
+    em.alias_map = {}
     em.var_infos = {}
+
+
+# C identifiers that would collide with Fortran statement keywords in emitted
+# positions (e.g. a C function literally named `function`).
+_FORTRAN_UNIT_KEYWORDS: Set[str] = {
+    "function", "subroutine", "result", "program", "contains", "end",
+    "block", "interface", "procedure", "module",
+}
+
+
+def rename_ast_identifiers(node: c_ast.Node, mapping: Dict[str, str]) -> None:
+    """Rename identifiers (definitions and references) throughout the AST."""
+    for attr in ("name", "declname"):
+        v = getattr(node, attr, None)
+        if isinstance(v, str) and v in mapping:
+            setattr(node, attr, mapping[v])
+    for _k, child in node.children():
+        if isinstance(child, c_ast.Node):
+            rename_ast_identifiers(child, mapping)
+
+
+def collect_keyword_collision_renames(ast_root: c_ast.FileAST) -> Dict[str, str]:
+    """Map C identifiers named like Fortran unit keywords to safe names."""
+    found: Set[str] = set()
+
+    def visit(node: c_ast.Node) -> None:
+        for attr in ("name", "declname"):
+            v = getattr(node, attr, None)
+            if isinstance(v, str) and v.lower() in _FORTRAN_UNIT_KEYWORDS:
+                found.add(v)
+        for _k, child in node.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(ast_root)
+    return {n: f"{n}_f" for n in found}
 
 
 def collect_called_names(node: c_ast.Node, names: Set[str]) -> Set[str]:
@@ -2877,6 +3143,9 @@ def transpile_c_to_fortran(
     src = expand_function_macros(src, collect_func_macros(text))
     parser = c_parser.CParser()
     ast = parser.parse(PRELUDE + "\n" + src)
+    keyword_renames = collect_keyword_collision_renames(ast)
+    if keyword_renames:
+        rename_ast_identifiers(ast, keyword_renames)
     real_prec = _detect_c_real_precision(src)
     dp_init = "kind(1.0)" if real_prec == "single" else "kind(1.0d0)"
     struct_defs = collect_struct_typedefs(ast)
@@ -2932,11 +3201,58 @@ def transpile_c_to_fortran(
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
     uses_rand = bool(collect_called_names(ast, {"rand"}))
     main_uses_rand = any(collect_called_names(m, {"rand"}) for m in mains)
+    uses_argv = False
+    for m in mains:
+        margs = m.decl.type.args
+        for p in (margs.params if margs is not None else []):
+            if (
+                isinstance(p, c_ast.Decl)
+                and p.name
+                and _classify_char_decl(p.type) == "array"
+                and ast_uses_any_id(m.body, {p.name})
+            ):
+                uses_argv = True
     module_proc_names: Set[str] = {e.decl.name for e in funcs}
+
+    # Resolve C function-pointer parameters to dummy-procedure interfaces:
+    # for each such parameter, find a module function passed at any call site.
+    func_ptr_param_idx: Dict[str, List[int]] = {}
+    for e in funcs + mains:
+        fd = e.decl.type
+        fps = [p for p in (fd.args.params if fd.args else []) if isinstance(p, c_ast.Decl)]
+        fp_idxs = [
+            i for i, p in enumerate(fps)
+            if isinstance(p.type, c_ast.PtrDecl) and isinstance(p.type.type, c_ast.FuncDecl)
+        ]
+        if fp_idxs:
+            func_ptr_param_idx[e.decl.name] = fp_idxs
+    if func_ptr_param_idx:
+        def _scan_fp_calls(node: c_ast.Node) -> None:
+            if (
+                isinstance(node, c_ast.FuncCall)
+                and isinstance(node.name, c_ast.ID)
+                and node.name.name in func_ptr_param_idx
+                and node.args is not None
+            ):
+                for i in func_ptr_param_idx[node.name.name]:
+                    if i < len(node.args.exprs):
+                        a = node.args.exprs[i]
+                        if isinstance(a, c_ast.ID) and a.name in module_proc_names:
+                            em.func_ptr_ifaces.setdefault((node.name.name, i), a.name)
+            for _k, child in node.children():
+                if isinstance(child, c_ast.Node):
+                    _scan_fp_calls(child)
+        _scan_fp_calls(ast)
+
     main_called_module_names: Set[str] = set()
     main_needed_types: Set[str] = set()
     for m in mains:
         main_called_module_names.update(collect_called_names(m, module_proc_names))
+        # Module functions passed by name (e.g. as function-pointer actuals)
+        # must also be imported.
+        for pname in module_proc_names:
+            if ast_uses_any_id(m.body, {pname}):
+                main_called_module_names.add(pname)
         # Struct types referenced by main via compound literals / constructors
         # (not just declared variables) must also be imported.
         main_needed_types |= collect_struct_type_uses(m.body, set(struct_defs.keys()))
@@ -2988,9 +3304,9 @@ def transpile_c_to_fortran(
         n for n in gvar_names if any(ast_uses_any_id(m.body, {n}) for m in mains)
     )
 
-    # Emit a module whenever there are module procedures, a rand() helper,
-    # struct type definitions, or shared global variables.
-    if funcs or uses_rand or struct_defs or global_vars:
+    # Emit a module whenever there are module procedures, a rand()/argv
+    # helper, struct type definitions, or shared global variables.
+    if funcs or uses_rand or uses_argv or struct_defs or global_vars:
         em.emit("module xc2f_mod")
         em.emit("implicit none")
         em.emit("private")
@@ -2998,6 +3314,8 @@ def transpile_c_to_fortran(
             publics = sorted(set(main_called_module_names) | set(main_needed_types))
             if main_uses_rand:
                 publics.append("rand")
+            if uses_argv:
+                publics.append("argv_value")
         else:
             publics = sorted(module_proc_names)
         publics.extend(sorted(struct_defs.keys()))
@@ -3011,7 +3329,9 @@ def transpile_c_to_fortran(
                 sdef = struct_defs[sname]
                 em.emit(f"type :: {sdef.name}")
                 for fname, ftype, shape in sdef.fields:
-                    if shape:
+                    if shape == ":":
+                        em.emit(f"   {ftype}, allocatable :: {fname}(:)")
+                    elif shape:
                         em.emit(f"   {ftype} :: {fname}({shape})")
                     else:
                         em.emit(f"   {ftype} :: {fname}")
@@ -3027,7 +3347,7 @@ def transpile_c_to_fortran(
                     decl += f" = {ginit}"
                 em.emit(decl)
             em.emit("")
-        if funcs or uses_rand:
+        if funcs or uses_rand or uses_argv:
             em.emit("contains")
             em.emit("")
             for ext in funcs:
@@ -3041,12 +3361,17 @@ def transpile_c_to_fortran(
             if uses_rand:
                 emit_rand_helper(em)
                 em.emit("")
+            if uses_argv:
+                emit_argv_helper(em)
+                em.emit("")
         em.emit("end module xc2f_mod")
         em.emit("")
 
     main_use_names = sorted(set(main_called_module_names) | set(main_needed_types) | set(main_used_gvars))
     if main_uses_rand:
         main_use_names.append("rand")
+    if uses_argv:
+        main_use_names.append("argv_value")
     for ext in mains:
         emit_function(
             ext,

@@ -4349,6 +4349,22 @@ def _is_simple_parameter_value(expr: str) -> bool:
     return False
 
 
+# Names whose parenthesized uses never modify their arguments: statement
+# keywords that look call-like plus common intrinsic functions.
+_PROMOTE_SAFE_CALL_NAMES: Set[str] = {
+    "if", "do", "while", "select", "case", "where", "call", "write", "read",
+    "print", "allocate", "deallocate", "allocated", "associated",
+    "merge", "size", "len", "len_trim", "trim", "int", "real", "dble", "abs",
+    "min", "max", "mod", "modulo", "sqrt", "exp", "log", "log10", "sin",
+    "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh",
+    "sum", "product", "matmul", "transpose", "dot_product", "reshape",
+    "spread", "pack", "count", "maxval", "minval", "maxloc", "minloc",
+    "nint", "floor", "ceiling", "sign", "huge", "tiny", "epsilon", "kind",
+    "iand", "ior", "ieor", "ishft", "not", "achar", "char", "ichar",
+    "lbound", "ubound", "norm2", "random_number", "ieee_value",
+}
+
+
 def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
     """Promote scalar locals assigned once to simple constants into PARAMETERs.
 
@@ -4373,6 +4389,36 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
     do_var_re = re.compile(r"^\s*do\s+([a-z_]\w*)\s*=", re.IGNORECASE)
     asn_re = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
     call_re = re.compile(r"^\s*call\s+[a-z_]\w*\s*\((.*)\)\s*$", re.IGNORECASE)
+
+    # Which dummy positions of procedures defined in this file may be written
+    # (intent(out)/intent(inout) or no visible intent). Names absent from this
+    # map are unknown callees; all their actuals are treated as mutable.
+    proc_mutable_dummy_pos: Dict[str, Set[int]] = {}
+    hdr_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\s+([a-z_]\w*)\s*\(([^)]*)\)",
+        re.IGNORECASE,
+    )
+    ui = 0
+    while ui < len(out):
+        mh = hdr_re.match(strip_comment(out[ui]).strip())
+        if mh is None:
+            ui += 1
+            continue
+        pname = mh.group(1).lower()
+        dummies = [a.strip().lower() for a in mh.group(2).split(",") if a.strip()]
+        uj = ui + 1
+        intent_by_dummy: Dict[str, str] = {}
+        while uj < len(out) and not unit_end_re.match(strip_comment(out[uj]).strip()):
+            dcode = strip_comment(out[uj]).strip()
+            mi = re.search(r"\bintent\s*\(\s*(in|out|inout)\s*\)", dcode, re.IGNORECASE)
+            if mi and "::" in dcode:
+                for dn in parse_declared_names_from_decl(dcode):
+                    intent_by_dummy[dn] = mi.group(1).lower()
+            uj += 1
+        proc_mutable_dummy_pos[pname] = {
+            pos for pos, dn in enumerate(dummies) if intent_by_dummy.get(dn, "out") != "in"
+        }
+        ui = uj + 1
 
     i = 0
     while i < len(out):
@@ -4399,12 +4445,18 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
         exec_start = k
 
         decl_info: Dict[str, Tuple[int, str, str]] = {}
+        array_names: Set[str] = set()
         for di in range(decl_start, exec_start):
             code, _comment = _split_code_comment(out[di].rstrip("\r\n"))
             if "::" not in code:
                 continue
             lhs, rhs = code.split("::", 1)
             lhs_spec = lhs.strip()
+            for ent in _split_top_level_commas(rhs):
+                e = ent.strip()
+                marr = re.match(r"^([a-z_]\w*)\s*\(", e, re.IGNORECASE)
+                if marr:
+                    array_names.add(marr.group(1).lower())
             if "parameter" in lhs_spec.lower():
                 continue
             # ALLOCATABLE/POINTER entities cannot become PARAMETERs, and a
@@ -4450,6 +4502,34 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
                 rhs = ma.group(2).strip()
                 assign_count[name] = assign_count.get(name, 0) + 1
                 assign_rhs[name] = rhs
+            # A scalar passed to a user function referenced inside an
+            # expression may bind to an INTENT(OUT/INOUT) dummy just like a
+            # `call` actual; keep such names as variables too. When the callee
+            # is defined in this file, only its mutable-dummy positions block.
+            for mfc in re.finditer(r"\b([a-z_]\w*)\s*\(", s, re.IGNORECASE):
+                fname = mfc.group(1).lower()
+                if fname in _PROMOTE_SAFE_CALL_NAMES or fname in array_names:
+                    continue
+                # extract the balanced argument list
+                depth = 0
+                jj = mfc.end() - 1
+                while jj < len(s):
+                    if s[jj] == "(":
+                        depth += 1
+                    elif s[jj] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    jj += 1
+                if jj >= len(s):
+                    continue
+                mutable_pos = proc_mutable_dummy_pos.get(fname)
+                for pos, actual in enumerate(_split_top_level_commas(s[mfc.end():jj])):
+                    if mutable_pos is not None and pos not in mutable_pos:
+                        continue
+                    ma_actual = re.fullmatch(r"\s*([a-z_]\w*)\s*", actual, re.IGNORECASE)
+                    if ma_actual:
+                        call_actuals.add(ma_actual.group(1).lower())
 
         promote: Dict[str, str] = {}
         for name, (_decl_i, _spec, _indent) in decl_info.items():
