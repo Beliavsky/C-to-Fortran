@@ -100,6 +100,10 @@ class VarInfo:
     ftype: str
     alloc: bool = False
     shape: Optional[Tuple[str, ...]] = None
+    # True for C strings (char arrays/pointers) lowered to Fortran character
+    # entities: scalar strings use substring indexing, arrays of strings use
+    # ordinary element indexing.
+    char_string: bool = False
 
 
 @dataclass
@@ -466,6 +470,38 @@ def type_has_const(type_decl: c_ast.Node) -> bool:
     return False
 
 
+def _classify_char_decl(type_decl: c_ast.Node) -> Optional[str]:
+    """Classify a C declaration type as a char-string entity.
+
+    Returns "scalar" for `char x[]` / `char x[64]` / `char *x` (one string),
+    "array" for `char *x[]` (an array of strings), or None when the base type
+    is not char or the declaration is a plain `char` scalar.
+    """
+    wrappers: List[str] = []
+    node = type_decl
+    while isinstance(node, (c_ast.ArrayDecl, c_ast.PtrDecl)):
+        wrappers.append("arr" if isinstance(node, c_ast.ArrayDecl) else "ptr")
+        node = node.type
+    if not isinstance(node, c_ast.TypeDecl) or not isinstance(node.type, c_ast.IdentifierType):
+        return None
+    if "char" not in [n.lower() for n in node.type.names]:
+        return None
+    if not wrappers:
+        return None  # plain `char c` scalar, not a string
+    if len(wrappers) == 1:
+        return "scalar"
+    if wrappers == ["arr", "ptr"]:
+        return "array"
+    return None
+
+
+def _char_array_decl_len(type_decl: c_ast.Node) -> Optional[str]:
+    """Return the declared buffer length of `char x[N]`, if constant."""
+    if isinstance(type_decl, c_ast.ArrayDecl) and type_decl.dim is not None:
+        return _render_dim_expr(type_decl.dim)
+    return None
+
+
 def _render_dim_expr(node: c_ast.Node) -> Optional[str]:
     """Render a constant array-dimension expression (literal, macro, or simple
     arithmetic) to Fortran text, or None if it is not a compile-time extent."""
@@ -487,6 +523,45 @@ def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
             return
         ftype, alloc = c_to_ftype(node.type)
         if node.name:
+            char_kind = _classify_char_decl(node.type)
+            if char_kind == "scalar":
+                buf_len = _char_array_decl_len(node.type)
+                if node.init is None and buf_len is not None:
+                    # Uninitialized buffer (e.g. sprintf target): fixed length.
+                    out[node.name] = VarInfo(
+                        ftype=f"character(len={buf_len})", char_string=True
+                    )
+                else:
+                    # Initialized string: deferred length holds the exact value.
+                    out[node.name] = VarInfo(
+                        ftype="character(len=:)", alloc=True, char_string=True
+                    )
+                for _, child in node.children():
+                    gather_decls(child, out)
+                return
+            if char_kind == "array":
+                n_elems: Optional[str] = None
+                if isinstance(node.type, c_ast.ArrayDecl) and node.type.dim is not None:
+                    n_elems = _render_dim_expr(node.type.dim)
+                elem_len = 1
+                if isinstance(node.init, c_ast.InitList):
+                    exprs = node.init.exprs or []
+                    if n_elems is None:
+                        n_elems = str(len(exprs))
+                    for e in exprs:
+                        if isinstance(e, c_ast.Constant) and e.type == "string":
+                            decoded = _decode_c_string_literal(e.value)
+                            if decoded is not None:
+                                elem_len = max(elem_len, len(decoded))
+                if n_elems is not None:
+                    out[node.name] = VarInfo(
+                        ftype=f"character(len={elem_len})",
+                        shape=(n_elems,),
+                        char_string=True,
+                    )
+                    for _, child in node.children():
+                        gather_decls(child, out)
+                    return
             dims: List[str] = []
             unsized_array = False
             type_node = node.type
@@ -858,6 +933,9 @@ class Emitter:
         self.define_constants: Dict[str, Tuple[str, str]] = define_constants or {}
         self.generic_macros: Dict[str, Dict[str, str]] = generic_macros or {}
         self.array_param_funcs: Dict[str, Set[int]] = {}
+        # Names of scalar C strings in the current unit: indexing them uses
+        # substrings and '\0' comparisons become length checks.
+        self.char_string_names: Set[str] = set()
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
@@ -945,6 +1023,34 @@ class Emitter:
             if norm is not None:
                 return f"{norm}.0_dp"
         return self.expr(node)
+
+    @staticmethod
+    def _is_nul_char_constant(node: c_ast.Node) -> bool:
+        if not (isinstance(node, c_ast.Constant) and node.type == "char"):
+            return False
+        try:
+            value = ast.literal_eval(node.value)
+        except (SyntaxError, ValueError):
+            return False
+        return isinstance(value, str) and len(value) == 1 and ord(value) == 0
+
+    def _nul_terminator_compare(self, n: c_ast.BinaryOp) -> Optional[str]:
+        """Rewrite `s[i] != '\\0'` (or ==) as an index-vs-length test."""
+        for ref, nul in ((n.left, n.right), (n.right, n.left)):
+            if not self._is_nul_char_constant(nul):
+                continue
+            if not (
+                isinstance(ref, c_ast.ArrayRef)
+                and isinstance(ref.name, c_ast.ID)
+                and ref.name.name.lower() in self.char_string_names
+            ):
+                continue
+            base = ref.name.name
+            idx = self.expr(ref.subscript)
+            if n.op == "!=":
+                return f"(({idx}) < len_trim({base}))"
+            return f"(({idx}) >= len_trim({base}))"
+        return None
 
     def _lower_call_args(self, fname: str, arg_nodes: List[c_ast.Node]) -> List[str]:
         """Lower call arguments, turning `&arr[i]` into an array section when the
@@ -1084,6 +1190,12 @@ class Emitter:
                 return self.simp(f"not({self.expr(n.expr)})")
         if isinstance(n, c_ast.BinaryOp):
             op = n.op
+            # `s[i] != '\0'` / `s[i] == '\0'` on a C string: in the exact-length
+            # Fortran model there is no terminator, so test the index bound.
+            if op in ("==", "!="):
+                nul_cmp = self._nul_terminator_compare(n)
+                if nul_cmp is not None:
+                    return nul_cmp
             # C pointer arithmetic used as "tail pointer" argument: a + k
             if op == "+":
                 if self._is_pointer_like_id(n.left):
@@ -1139,6 +1251,11 @@ class Emitter:
             t_expr, f_expr = self._pad_char_literals(self.expr(n.iftrue), self.expr(n.iffalse))
             return f"merge({t_expr}, {f_expr}, {self.cond_expr(n.cond)})"
         if isinstance(n, c_ast.ArrayRef):
+            # Indexing a scalar C string reads one character: use a substring.
+            if isinstance(n.name, c_ast.ID) and n.name.name.lower() in self.char_string_names:
+                base = n.name.name
+                idx_txt = self.expr(n.subscript)
+                return f"{base}(({idx_txt})+1:({idx_txt})+1)"
             # C multidimensional arrays are row-major. Reverse both dimensions
             # and subscripts in Fortran so a flat initializer retains its order.
             indices: List[c_ast.Node] = []
@@ -1188,6 +1305,11 @@ class Emitter:
                 args = [self.expr(a) for a in n.args.exprs]
             if fname in {"fabs", "fabsf", "fabsl"} and len(args) >= 1:
                 return self.simp(f"abs({args[0]})")
+            if fname == "strlen" and len(args) == 1:
+                return self.simp(f"len_trim({args[0]})")
+            if fname == "strcmp" and len(args) == 2:
+                a0, a1 = args
+                return self.simp(f"merge(-1, merge(1, 0, {a0} > {a1}), {a0} < {a1})")
             if fname in {"fminf", "fmin"} and len(args) >= 2:
                 return self.simp(f"min({args[0]}, {args[1]})")
             if fname in {"fmaxf", "fmax"} and len(args) >= 2:
@@ -1260,13 +1382,21 @@ class Emitter:
         r"%([-+ 0#]*)(\d+|\*)?(?:\.(\d+|\*))?(?:hh|h|ll|l|j|z|t|L)*([diouxXeEfFgGaAcs%])"
     )
 
-    def _translate_printf(self, fmt_literal: str, vals: List[c_ast.Node]) -> Optional[List[str]]:
+    def _translate_printf(
+        self,
+        fmt_literal: str,
+        vals: List[c_ast.Node],
+        *,
+        unit: str = "*",
+        internal: bool = False,
+    ) -> Optional[List[str]]:
         """Translate a C printf format + arguments to a Fortran write statement.
 
         Returns the emitted line(s), or ``None`` if the format cannot be
         represented (so the caller can fall back). Literal text (labels) is
         preserved and each conversion becomes a separate edit descriptor, so
-        fields never run together.
+        fields never run together. With ``internal=True`` the write targets a
+        character variable (sprintf) where advance= is not allowed.
         """
         text = _decode_c_string_literal(fmt_literal)
         if text is None:
@@ -1274,7 +1404,7 @@ class Emitter:
         advance = True
         if text.endswith("\n"):
             text = text[:-1]
-        else:
+        elif not internal:
             advance = False
 
         fmt_items: List[str] = []
@@ -1313,7 +1443,12 @@ class Emitter:
                     return None
                 flush_lit()
                 fmt_items.append(desc)
-                arg_exprs.append(self.expr(vals[vi]))
+                arg_txt = self.expr(vals[vi])
+                # %s: trim trailing blanks that fixed-length or padded Fortran
+                # strings carry; exact-length strings are unaffected.
+                if conv == "s" and not re.match(r'^".*"$', arg_txt, re.DOTALL):
+                    arg_txt = f"trim({arg_txt})"
+                arg_exprs.append(arg_txt)
                 vi += 1
                 continue
             lit.append(ch)
@@ -1323,14 +1458,14 @@ class Emitter:
         if vi != len(vals):
             return None  # argument count mismatch; let caller fall back.
 
-        adv = "" if advance else ', advance="no"'
+        adv = "" if (advance or internal) else ', advance="no"'
         if not fmt_items:
             # Pure newline (or empty) format: emit a blank record.
-            return ["write(*,*)"] if advance else []
+            return [f"write({unit},*)"] if advance else []
         fmt = "'(" + ", ".join(fmt_items) + ")'"
         if arg_exprs:
-            return [f"write(*, {fmt}{adv}) {', '.join(arg_exprs)}"]
-        return [f"write(*, {fmt}{adv})"]
+            return [f"write({unit}, {fmt}{adv}) {', '.join(arg_exprs)}"]
+        return [f"write({unit}, {fmt}{adv})"]
 
     def emit_printf(self, fc: c_ast.FuncCall) -> bool:
         args = fc.args.exprs if fc.args is not None else []
@@ -1393,6 +1528,14 @@ class Emitter:
         if name in params:
             return
         if ret_name is not None and name == ret_name:
+            return
+        if info.char_string and not info.shape:
+            # Scalar C string: deferred-length allocatable (exact value) or a
+            # fixed-length buffer; never a rank-1 array.
+            if info.alloc:
+                self.emit(f"{info.ftype}, allocatable :: {name}")
+            else:
+                self.emit(f"{info.ftype} :: {name}")
             return
         if info.alloc:
             self.emit(f"{info.ftype}, allocatable :: {name}(:)")
@@ -1889,6 +2032,40 @@ class Emitter:
         return False
 
     def emit_if(self, st: c_ast.If, ret_name: Optional[str], array_result_name: Optional[str] = None) -> None:
+        # sscanf result check: `if (sscanf(src, fmt, &a, ...) != N)` becomes an
+        # internal read with an iostat success/failure test.
+        cond = st.cond
+        if (
+            isinstance(cond, c_ast.BinaryOp)
+            and cond.op in ("!=", "==")
+            and isinstance(cond.left, c_ast.FuncCall)
+            and isinstance(cond.left.name, c_ast.ID)
+            and cond.left.name.name == "sscanf"
+            and isinstance(cond.right, c_ast.Constant)
+            and cond.left.args is not None
+            and len(cond.left.args.exprs) >= 3
+        ):
+            fc = cond.left
+            src = self.expr(fc.args.exprs[0])
+            targets = ", ".join(self.expr(a) for a in fc.args.exprs[2:])
+            self.emit("block")
+            self.indent += 3
+            self.emit("integer :: ios")
+            self.emit(f"read({src}, *, iostat=ios) {targets}")
+            cmp = "/=" if cond.op == "!=" else "=="
+            self.emit(f"if (ios {cmp} 0) then")
+            self.indent += 3
+            self.emit_stmt(st.iftrue, ret_name=ret_name, array_result_name=array_result_name)
+            self.indent -= 3
+            if st.iffalse is not None:
+                self.emit("else")
+                self.indent += 3
+                self.emit_stmt(st.iffalse, ret_name=ret_name, array_result_name=array_result_name)
+                self.indent -= 3
+            self.emit("end if")
+            self.indent -= 3
+            self.emit("end block")
+            return
         # suppress C pointer/null checks that are not needed after signature lowering
         if isinstance(st.cond, c_ast.BinaryOp) and st.cond.op in ("==", "!="):
             l_is_null = isinstance(st.cond.left, c_ast.ID) and st.cond.left.name == "NULL"
@@ -1984,6 +2161,12 @@ class Emitter:
             # declarations already hoisted
             if st.init is not None:
                 info = self.var_infos.get((st.name or "").lower())
+                if isinstance(st.init, c_ast.InitList) and info is not None and info.shape and info.char_string:
+                    # Array of C strings: a typed constructor pads shorter
+                    # literals to the common declared length.
+                    vals = ", ".join(self.expr(e) for e in (st.init.exprs or []))
+                    self.emit(f"{st.name} = [{info.ftype} :: {vals}]")
+                    return
                 if isinstance(st.init, c_ast.InitList) and info is not None and info.shape:
                     struct_elem = re.match(r"^type\(([^)]+)\)$", info.ftype, re.IGNORECASE)
                     if struct_elem is not None and struct_elem.group(1).lower() in self.struct_defs:
@@ -2155,6 +2338,36 @@ class Emitter:
                 else:
                     self.emit("write(*,*)")
                 return
+            if isinstance(st.name, c_ast.ID) and st.name.name in ("strcat", "strcpy"):
+                args = st.args.exprs if st.args is not None else []
+                if len(args) == 2:
+                    dst = self.expr(args[0])
+                    src = self.expr(args[1])
+                    if st.name.name == "strcpy":
+                        self.emit(f"{dst} = {src}")
+                    else:
+                        # Deferred-length strings hold their exact value; fixed
+                        # buffers carry blank padding that must be trimmed first.
+                        dinfo = self.var_infos.get(dst.lower())
+                        dst_expr = dst if (dinfo is not None and dinfo.alloc) else f"trim({dst})"
+                        self.emit(f"{dst} = {dst_expr} // {src}")
+                    return
+            if isinstance(st.name, c_ast.ID) and st.name.name == "sprintf":
+                args = st.args.exprs if st.args is not None else []
+                if len(args) >= 2 and isinstance(args[1], c_ast.Constant) and args[1].type == "string":
+                    buf = self.expr(args[0])
+                    lines = self._translate_printf(args[1].value, list(args[2:]), unit=buf, internal=True)
+                    if lines is not None:
+                        for line in lines:
+                            self.emit(line)
+                        return
+            if isinstance(st.name, c_ast.ID) and st.name.name == "sscanf":
+                args = st.args.exprs if st.args is not None else []
+                if len(args) >= 3:
+                    src = self.expr(args[0])
+                    targets = ", ".join(self.expr(a) for a in args[2:])
+                    self.emit(f"read({src}, *) {targets}")
+                    return
             if isinstance(st.name, c_ast.ID) and st.name.name in ("exit", "_Exit", "abort"):
                 args = st.args.exprs if st.args is not None else []
                 code = self.expr(args[0]) if args else "0"
@@ -2304,6 +2517,10 @@ def emit_function(
         gather_decls(fn.body, locals_map)
         em.var_infos = {k.lower(): v for k, v in locals_map.items()}
         for n, info in locals_map.items():
+            if info.char_string:
+                if not info.shape:
+                    em.char_string_names.add(n.lower())
+                continue
             if info.alloc:
                 em.pointer_like_names.add(n.lower())
         em.indent = 0
@@ -2311,6 +2528,7 @@ def emit_function(
         em.emit_stmt(fn.body, ret_name=None)
         em.emit("end program main")
         em.pointer_like_names.clear()
+        em.char_string_names.clear()
         em.var_infos = {}
         return
 
@@ -2342,6 +2560,9 @@ def emit_function(
         em.emit(f"{recursive_prefix}function {name}({', '.join(pnames)}) result({result_name_for_body})")
         unit_kind = "function"
         result_decl_ftype = ret_ftype
+        if ret_ftype.lower().startswith("character"):
+            # A char*-returning C function yields an exact-length string.
+            result_decl_ftype = "character(len=:), allocatable"
     em.emit(f"! {proc_docline(name, unit_kind)}")
     if c_header_comment:
         em.lines[-1] = f"! {c_header_comment}"
@@ -2437,7 +2658,11 @@ def emit_function(
         inline_doc = c_arg_comments.get(p.name.lower()) or param_comment_map.get(p.name.lower()) or arg_docline(
             p.name, p_ft, intent=intent, is_array=is_array_dummy
         )
-        if p_ptr_or_arr and is_array_dummy:
+        if _classify_char_decl(p.type) == "scalar":
+            # A C string parameter is one assumed-length character scalar.
+            em.emit(add_inline_comment(f"character(len=*), {intent} :: {p.name}", inline_doc))
+            em.char_string_names.add(p.name.lower())
+        elif p_ptr_or_arr and is_array_dummy:
             rank = max(1, dummy_array_rank(p.type))
             dims = ", ".join([":"] * rank)
             em.emit(add_inline_comment(f"{p_ft}, {intent} :: {p.name}({dims})", inline_doc))
@@ -2456,6 +2681,10 @@ def emit_function(
     gather_decls(fn.body, locals_map)
     em.var_infos = {k.lower(): v for k, v in locals_map.items()}
     for n, info in locals_map.items():
+        if info.char_string:
+            if not info.shape:
+                em.char_string_names.add(n.lower())
+            continue
         if info.alloc:
             em.pointer_like_names.add(n.lower())
     if out_idx is not None and out_param_name is not None:
@@ -2489,6 +2718,7 @@ def emit_function(
     em.array_result_name = None
     em.array_result_tmp_alias = None
     em.pointer_like_names.clear()
+    em.char_string_names.clear()
     em.var_infos = {}
 
 

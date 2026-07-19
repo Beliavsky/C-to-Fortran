@@ -1148,8 +1148,12 @@ def remove_pre_overwrite_assignments(lines: List[str], *, lookahead: int = 8) ->
                 continue
             m2 = assign_re.match(s)
             if m2 is not None and m2.group(1).lower() == v:
-                out[i] = ""
-                replaced = True
+                # Self-referencing updates (e.g. `a = a // b`) read the prior
+                # value, so the earlier assignment is live.
+                rhs2 = s.split("=", 1)[1]
+                if not pat.search(rhs2):
+                    out[i] = ""
+                    replaced = True
             break
         if replaced:
             i = j

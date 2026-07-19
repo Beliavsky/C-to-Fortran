@@ -4407,6 +4407,10 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
             lhs_spec = lhs.strip()
             if "parameter" in lhs_spec.lower():
                 continue
+            # ALLOCATABLE/POINTER entities cannot become PARAMETERs, and a
+            # deferred length (len=:) is only legal on those, so skip them.
+            if re.search(r"\ballocatable\b|\bpointer\b|len\s*=\s*:", lhs_spec, re.IGNORECASE):
+                continue
             indent = code[: len(code) - len(code.lstrip())]
             for ent in _split_top_level_commas(rhs):
                 e = ent.strip()
