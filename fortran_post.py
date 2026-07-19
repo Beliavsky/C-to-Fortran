@@ -1695,6 +1695,51 @@ def _split_top_level_csv(text: str) -> List[str]:
     return out
 
 
+def _rewrite_call_drop_arg(code: str, fname: str, n_idx: int) -> str:
+    """Remove the ``n_idx``-th argument from every ``fname(...)`` call in code.
+
+    Handles nested parentheses in the argument list (unlike a flat regex).
+    """
+    call_re = re.compile(rf"\b{re.escape(fname)}\s*\(", re.IGNORECASE)
+    out: List[str] = []
+    i = 0
+    while i < len(code):
+        m = call_re.search(code, i)
+        if m is None:
+            out.append(code[i:])
+            break
+        out.append(code[i:m.start()])
+        open_paren = m.end() - 1
+        depth = 0
+        j = open_paren
+        instr: Optional[str] = None
+        while j < len(code):
+            ch = code[j]
+            if instr is not None:
+                if ch == instr:
+                    instr = None
+            elif ch in ("'", '"'):
+                instr = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(code):
+            out.append(code[m.start():])
+            break
+        argv = _split_top_level_csv(code[open_paren + 1:j])
+        if len(argv) > n_idx:
+            del argv[n_idx]
+            out.append(f"{code[m.start():open_paren]}({', '.join(a.strip() for a in argv)})")
+        else:
+            out.append(code[m.start():j + 1])
+        i = j + 1
+    return "".join(out)
+
+
 def remove_redundant_size_dummy_args(lines: List[str]) -> List[str]:
     """Remove redundant integer size dummies for assumed-shape args.
 
@@ -1792,6 +1837,22 @@ def remove_redundant_size_dummy_args(lines: List[str]) -> List[str]:
             if bad:
                 continue
 
+            # If n is used as an array subscript (e.g. `arr(n+1)`), it is an
+            # index, not the extent, so replacing it with size(arr) is wrong
+            # (e.g. `degree` in a Horner evaluation). Keep it in that case.
+            subscript_re = re.compile(
+                rf"[a-z_]\w*\s*\([^)]*\b{re.escape(nlow)}\b", re.IGNORECASE
+            )
+            for k in range(i + 1, j):
+                c = fscan.strip_comment(out[k])
+                if "::" in c:
+                    continue
+                if subscript_re.search(c):
+                    bad = True
+                    break
+            if bad:
+                continue
+
             # rewrite executable uses n -> size(arr)
             pat_n = re.compile(rf"\b{re.escape(nlow)}\b", re.IGNORECASE)
             for k in range(i + 1, j):
@@ -1815,8 +1876,7 @@ def remove_redundant_size_dummy_args(lines: List[str]) -> List[str]:
             new_ln, _chg = xunused.rewrite_decl_remove_names(out[dk], {nlow})
             out[dk] = "" if new_ln is None else new_ln
 
-            # rewrite call sites and expression invocations globally (simple)
-            call_pat = re.compile(rf"\b{re.escape(fname)}\s*\(([^()]*)\)", re.IGNORECASE)
+            # rewrite call sites and expression invocations globally
             n_idx = [idx for idx, a in enumerate(args) if a.lower() == nlow][0]
             for k in range(len(out)):
                 if k >= i and k <= j:
@@ -1824,15 +1884,7 @@ def remove_redundant_size_dummy_args(lines: List[str]) -> List[str]:
                 c, com = xunused.split_code_comment(out[k].rstrip("\r\n"))
                 if fname not in c.lower():
                     continue
-
-                def _repl(m: re.Match[str]) -> str:
-                    argv = _split_top_level_csv(m.group(1))
-                    if len(argv) <= n_idx:
-                        return m.group(0)
-                    del argv[n_idx]
-                    return f"{fname}({', '.join(argv)})"
-
-                nc = call_pat.sub(_repl, c)
+                nc = _rewrite_call_drop_arg(c, fname, n_idx)
                 if nc != c:
                     eol2 = "\n" if out[k].endswith("\n") else ""
                     out[k] = f"{nc}{com}{eol2}"

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 
 import pytest
 
 import xc2f
+
+
+def test_gfortran_stops_after_first_compile_error() -> None:
+    assert "-Wfatal-errors" in xc2f.DEFAULT_GFORTRAN_FLAGS
 
 
 def transpile_main(body: str) -> str:
@@ -87,6 +92,31 @@ def test_inline_single_use_temp_preserves_expression_precedence() -> None:
     text = "".join(xc2f.inline_single_use_temp_assignments(lines))
 
     assert "product = (2.0 + 3.0) * 4.0" in text
+
+
+def test_compile_both_requires_both_compilers_to_succeed() -> None:
+    args = argparse.Namespace(
+        run_both=False,
+        run=False,
+        compile_both=True,
+        compile_both_c=False,
+        compile_c=False,
+    )
+
+    assert xc2f._requested_actions_succeeded(
+        args,
+        original_run_ok=False,
+        original_build_ok=True,
+        fortran_run_ok=False,
+        fortran_build_ok=True,
+    )
+    assert not xc2f._requested_actions_succeeded(
+        args,
+        original_run_ok=False,
+        original_build_ok=True,
+        fortran_run_ok=False,
+        fortran_build_ok=False,
+    )
 
 
 @pytest.mark.integration

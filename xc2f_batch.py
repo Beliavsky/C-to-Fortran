@@ -337,6 +337,8 @@ def main() -> int:
         if args.time_both:
             cmd.append("--time-both")
 
+        if i > 1 and (not args.terse or args.run_both):
+            print("")
         if not args.terse:
             print(f"[{i}/{total}] {rel}")
         if args.run_both:
@@ -366,11 +368,7 @@ def main() -> int:
                 if args.maxfail > 0 and failures >= args.maxfail:
                     print(f"Stopped at maxfail={args.maxfail}.")
                     break
-                if (not args.terse) and i < total:
-                    print("")
                 continue
-            if (not args.terse) and i < total:
-                print("")
             continue
         cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="ignore")
         ok = cp.returncode == 0
@@ -385,6 +383,8 @@ def main() -> int:
                     print(cp.stderr.rstrip())
         else:
             status = "FAIL"
+            if args.terse and failures > 0:
+                print("")
             failures += 1
             if args.terse:
                 print(f"[{i}/{total}] {rel}")
@@ -417,9 +417,6 @@ def main() -> int:
                 fortran_source=str(out_path),
             )
         )
-        if (not args.terse) and i < total:
-            print("")
-
     print("")
     print("Summary:")
     summary_rows = [r for r in results if (not args.terse or not r.ok)]

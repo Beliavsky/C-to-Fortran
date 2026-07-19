@@ -64,7 +64,7 @@ def test_run_both_builds_everything_before_running(tmp_path, monkeypatch) -> Non
     ]
 
 
-def test_run_both_batch_continues_after_a_failed_file(tmp_path, monkeypatch) -> None:
+def test_run_both_batch_continues_after_a_failed_file(tmp_path, monkeypatch, capsys) -> None:
     sources = [tmp_path / "first.c", tmp_path / "second.c"]
     for source in sources:
         source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
@@ -90,3 +90,6 @@ def test_run_both_batch_continues_after_a_failed_file(tmp_path, monkeypatch) -> 
 
     assert xc2f_batch.main() == 1
     assert processed == sources
+    output = capsys.readouterr().out
+    assert f"[1/2] {sources[0]}" in output
+    assert f"\n\n[2/2] {sources[1]}" in output

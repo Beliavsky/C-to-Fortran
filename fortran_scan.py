@@ -4125,6 +4125,11 @@ def demote_fixed_size_single_allocatables(lines: List[str]) -> List[str]:
             continue
 
         a_idx, shape = alloc_hits[0]
+        # Only demote to an explicit-shape array when the extent is a compile-time
+        # constant; a runtime bound (e.g. `x(n)`) is not valid for a non-dummy
+        # local/program array and must stay allocatable.
+        if not re.match(r"^[\d\s+\-*/()]+$", shape):
+            continue
         d_code, d_comment = _split_code_comment(out[d_idx].rstrip("\r\n"))
         md = decl_re.match(d_code.strip())
         if md is None:
@@ -5413,11 +5418,15 @@ def avoid_reserved_identifier_definitions(
         used.add(cand.lower())
         return cand
 
+    # Intrinsic type names are accepted by Fortran as entity/component names,
+    # and renaming them line-globally would corrupt the type-spec they share a
+    # line with (e.g. `real(kind=dp) :: real`), so leave such variable names be.
+    type_name_kw = {"real", "integer", "logical", "character", "complex", "double", "precision"}
     for n in sorted(proc_names):
         if n in bad:
             mapping[n] = mk_name(n, "_f")
     for n in sorted(var_names):
-        if n in bad and n not in mapping:
+        if n in bad and n not in mapping and n not in type_name_kw:
             mapping[n] = mk_name(n, "_v")
     if not mapping:
         return lines
@@ -5576,6 +5585,9 @@ def find_set_but_never_read_local_edits(lines: List[str]) -> DeadStoreEdits:
                 rest = m_do.group(2)
                 if iv in declared:
                     writes.setdefault(iv, set()).add(sln)
+                    # A DO index must remain declared even if its value is never
+                    # read inside the body, so treat the loop control as a read.
+                    reads.setdefault(iv, set()).add(sln)
                 for r in _extract_ident_reads(rest, declared):
                     reads.setdefault(r, set()).add(sln)
                 continue

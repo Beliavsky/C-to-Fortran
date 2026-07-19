@@ -65,6 +65,7 @@ double cimag(complex_double);
 DEFAULT_GFORTRAN_FLAGS = [
     "-O0",
     "-Wall",
+    "-Wfatal-errors",
     "-Werror=unused-parameter",
     "-Werror=unused-variable",
     "-Werror=unused-function",
@@ -110,6 +111,21 @@ class StructDef:
 
 
 _STRUCT_TYPEDEFS: Set[str] = set()
+
+# Common <limits.h>/<stdint.h> constants lowered to literal values.
+_C_LIMIT_CONSTANTS: Dict[str, str] = {
+    "INT_MAX": "2147483647",
+    "INT_MIN": "(-2147483647 - 1)",
+    "UINT_MAX": "4294967295",
+    "LONG_MAX": "9223372036854775807",
+    "SHRT_MAX": "32767",
+    "SHRT_MIN": "(-32768)",
+    "USHRT_MAX": "65535",
+    "CHAR_BIT": "8",
+    "SCHAR_MAX": "127",
+    "SCHAR_MIN": "(-128)",
+    "UCHAR_MAX": "255",
+}
 
 
 def strip_preprocessor_and_comments(text: str) -> str:
@@ -414,6 +430,22 @@ def c_to_ftype(type_decl: c_ast.Node) -> Tuple[str, bool]:
     return "integer", alloc
 
 
+def dummy_array_rank(type_decl: c_ast.Node) -> int:
+    """Count the array rank of a C parameter type (arrays + pointers)."""
+    rank = 0
+    node = type_decl
+    while node is not None:
+        if isinstance(node, c_ast.ArrayDecl):
+            rank += 1
+            node = node.type
+        elif isinstance(node, c_ast.PtrDecl):
+            rank += 1
+            node = node.type
+        else:
+            break
+    return rank
+
+
 def type_is_ptr_or_array(type_decl: c_ast.Node) -> bool:
     node = type_decl
     while node is not None:
@@ -434,6 +466,21 @@ def type_has_const(type_decl: c_ast.Node) -> bool:
     return False
 
 
+def _render_dim_expr(node: c_ast.Node) -> Optional[str]:
+    """Render a constant array-dimension expression (literal, macro, or simple
+    arithmetic) to Fortran text, or None if it is not a compile-time extent."""
+    if isinstance(node, c_ast.Constant):
+        return Emitter._normalize_int_literal(node.value) or node.value
+    if isinstance(node, c_ast.ID):
+        return node.name
+    if isinstance(node, c_ast.BinaryOp):
+        left = _render_dim_expr(node.left)
+        right = _render_dim_expr(node.right)
+        if left is not None and right is not None and node.op in ("+", "-", "*", "/"):
+            return f"({left} {node.op} {right})"
+    return None
+
+
 def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
     if isinstance(node, c_ast.Decl):
         if isinstance(node.type, c_ast.FuncDecl):
@@ -441,17 +488,22 @@ def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
         ftype, alloc = c_to_ftype(node.type)
         if node.name:
             dims: List[str] = []
+            unsized_array = False
             type_node = node.type
             while isinstance(type_node, c_ast.ArrayDecl):
                 if type_node.dim is None:
                     dims = []
+                    unsized_array = True
                     break
-                if isinstance(type_node.dim, c_ast.Constant):
-                    dims.append(type_node.dim.value)
-                else:
+                dim_txt = _render_dim_expr(type_node.dim)
+                if dim_txt is None:
                     dims = []
                     break
+                dims.append(dim_txt)
                 type_node = type_node.type
+            # `int x[] = {a, b, c}`: infer the extent from the initializer.
+            if unsized_array and isinstance(node.init, c_ast.InitList):
+                dims = [str(len(node.init.exprs or []))]
             out[node.name] = VarInfo(
                 ftype=ftype,
                 alloc=alloc,
@@ -582,6 +634,83 @@ def _split_top_level_commas(s: str) -> List[str]:
     if cur:
         parts.append("".join(cur))
     return parts
+
+
+def collect_func_macros(text: str) -> Dict[str, Tuple[List[str], str]]:
+    """Collect object-like function macros ``#define NAME(a, b) body``.
+
+    Excludes ``_Generic`` macros (handled separately). Returns name ->
+    (params, body_text).
+    """
+    out: Dict[str, Tuple[List[str], str]] = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^\s*#\s*define\b", line):
+            full = line
+            while full.rstrip().endswith("\\") and i + 1 < len(lines):
+                full = full.rstrip()[:-1] + " " + lines[i + 1]
+                i += 1
+            m = re.match(r"^\s*#\s*define\s+([A-Za-z_]\w*)\(([^)]*)\)\s+(.+)$", full)
+            if m is not None and "_Generic" not in m.group(3):
+                params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+                out[m.group(1)] = (params, m.group(3).strip())
+        i += 1
+    return out
+
+
+def expand_function_macros(src: str, macros: Dict[str, Tuple[List[str], str]]) -> str:
+    """Textually expand function-like macro invocations in C source."""
+    if not macros:
+        return src
+    for _ in range(16):  # iterate to expand nested invocations
+        changed = False
+        for name, (params, body) in macros.items():
+            call_re = re.compile(rf"\b{re.escape(name)}\s*\(")
+            result: List[str] = []
+            i = 0
+            while i < len(src):
+                m = call_re.search(src, i)
+                if m is None:
+                    result.append(src[i:])
+                    break
+                depth = 0
+                j = m.end() - 1
+                instr: Optional[str] = None
+                while j < len(src):
+                    ch = src[j]
+                    if instr is not None:
+                        if ch == instr:
+                            instr = None
+                    elif ch in ("'", '"'):
+                        instr = ch
+                    elif ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if j >= len(src):
+                    result.append(src[i:])
+                    break
+                argv = _split_top_level_commas(src[m.end():j])
+                if len(params) == len(argv) and (params or not argv):
+                    expanded = body
+                    for pname, aval in zip(params, argv):
+                        expanded = re.sub(rf"\b{re.escape(pname)}\b", f"({aval.strip()})", expanded)
+                    result.append(src[i:m.start()])
+                    result.append(f"({expanded})")
+                    changed = True
+                    i = j + 1
+                else:
+                    result.append(src[i:j + 1])
+                    i = j + 1
+            src = "".join(result)
+        if not changed:
+            break
+    return src
 
 
 def collect_generic_macros(text: str) -> Dict[str, Dict[str, str]]:
@@ -728,6 +857,7 @@ class Emitter:
         self.struct_defs: Dict[str, StructDef] = struct_defs or {}
         self.define_constants: Dict[str, Tuple[str, str]] = define_constants or {}
         self.generic_macros: Dict[str, Dict[str, str]] = generic_macros or {}
+        self.array_param_funcs: Dict[str, Set[int]] = {}
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
@@ -764,11 +894,71 @@ class Emitter:
 
     def cond_expr(self, n: c_ast.Node) -> str:
         """Lower a C condition to a scalar Fortran logical expression."""
-        if isinstance(n, c_ast.BinaryOp) and n.op in {"&&", "||", "==", "!=", "<", "<=", ">", ">="}:
+        if isinstance(n, c_ast.BinaryOp) and n.op in {"&&", "||"}:
+            # Recurse so integer operands (e.g. `flag && i < n`) each become
+            # proper logical expressions before the .and./.or. connective.
+            conn = ".and." if n.op == "&&" else ".or."
+            return self.simp(f"({self.cond_expr(n.left)} {conn} {self.cond_expr(n.right)})")
+        if isinstance(n, c_ast.BinaryOp) and n.op in {"==", "!=", "<", "<=", ">", ">="}:
             return self.simp(self.expr(n))
         if isinstance(n, c_ast.UnaryOp) and n.op == "!":
             return self.simp(self.expr(n))
         return self.simp(f"({self.expr(n)} /= 0)")
+
+    @staticmethod
+    def _normalize_int_literal(txt: str) -> Optional[str]:
+        """Convert a C integer literal (hex/octal + u/l suffixes) to decimal."""
+        m = re.match(r"^([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]+|\d+)[uUlL]*$", txt.strip())
+        if m is None:
+            return None
+        sign, body = m.group(1), m.group(2)
+        try:
+            if body[:2] in ("0x", "0X"):
+                value = int(body, 16)
+            elif len(body) > 1 and body[0] == "0":
+                value = int(body, 8)
+            else:
+                value = int(body, 10)
+        except ValueError:
+            return None
+        return f"{sign}{value}"
+
+    @staticmethod
+    def _decode_char_constant(token: str) -> str:
+        """Translate a C character constant to a Fortran character expression."""
+        try:
+            value = ast.literal_eval(token)
+        except (SyntaxError, ValueError):
+            value = None
+        if not isinstance(value, str) or len(value) != 1:
+            return token
+        code = ord(value)
+        if value in {"\n", "\r", "\t", "\v", "\f", "\b", "\a"} or code == 0 or code > 126:
+            return f"achar({code})"
+        return '"' + value.replace('"', '""') + '"'
+
+    def _init_elem_expr(self, node: c_ast.Node, real_target: bool) -> str:
+        """Expr for an array initializer element, promoting ints to reals when
+        the array element type is real (Fortran array constructors are typed)."""
+        if real_target and isinstance(node, c_ast.Constant) and node.type == "int":
+            norm = self._normalize_int_literal(node.value)
+            if norm is not None:
+                return f"{norm}.0_dp"
+        return self.expr(node)
+
+    def _lower_call_args(self, fname: str, arg_nodes: List[c_ast.Node]) -> List[str]:
+        """Lower call arguments, turning `&arr[i]` into an array section when the
+        callee's corresponding parameter is an array (C array decay)."""
+        arr_idxs = self.array_param_funcs.get(fname, set())
+        out: List[str] = []
+        for idx, a in enumerate(arg_nodes):
+            if idx in arr_idxs and isinstance(a, c_ast.UnaryOp) and a.op == "&" and isinstance(a.expr, c_ast.ArrayRef):
+                base = self.expr(a.expr.name)
+                off = self.expr(a.expr.subscript)
+                out.append(base if off.strip() in ("0", "+0") else f"{base}(({off})+1:)")
+            else:
+                out.append(self.expr(a))
+        return out
 
     def _is_pointer_like_id(self, n: c_ast.Node) -> bool:
         return isinstance(n, c_ast.ID) and n.name.lower() in self.pointer_like_names
@@ -822,7 +1012,13 @@ class Emitter:
         if isinstance(n, c_ast.Constant):
             if n.type == "string":
                 return n.value
+            if n.type == "char":
+                return self._decode_char_constant(n.value)
             txt = n.value
+            if n.type == "int" or re.match(r"^[+-]?\d", txt):
+                normalized = self._normalize_int_literal(txt)
+                if normalized is not None:
+                    return normalized
             # Normalize C float suffixes (e.g. 0.0f, 1e-3F) to Fortran-real literals.
             txt = re.sub(r"(?i)^([+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[e][+-]?\d+)?)f$", r"\1", txt)
             return txt
@@ -831,6 +1027,18 @@ class Emitter:
                 return "0"
             if n.name == "RAND_MAX":
                 return "2147483647"
+            if n.name == "EXIT_SUCCESS":
+                return "0"
+            if n.name == "EXIT_FAILURE":
+                return "1"
+            if n.name in _C_LIMIT_CONSTANTS:
+                return _C_LIMIT_CONSTANTS[n.name]
+            if n.name == "stderr":
+                return "0"
+            if n.name == "stdout":
+                return "6"
+            if n.name == "stdin":
+                return "5"
             if n.name == "NAN":
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
             if n.name in {"INFINITY", "HUGE_VAL"}:
@@ -872,6 +1080,8 @@ class Emitter:
                 if isinstance(n.expr, c_ast.ID):
                     return self.simp(f"({self.expr(n.expr)} == 0)")
                 return self.simp(f".not. ({self.expr(n.expr)})")
+            if op == "~":
+                return self.simp(f"not({self.expr(n.expr)})")
         if isinstance(n, c_ast.BinaryOp):
             op = n.op
             # C pointer arithmetic used as "tail pointer" argument: a + k
@@ -910,6 +1120,17 @@ class Emitter:
                     return self.simp(f"({ltxt}**2)")
             if op == "%":
                 return self.simp(f"mod({self.expr(n.left)}, {self.expr(n.right)})")
+            # C bitwise operators map to Fortran bit intrinsics.
+            if op == "&":
+                return self.simp(f"iand({self.expr(n.left)}, {self.expr(n.right)})")
+            if op == "|":
+                return self.simp(f"ior({self.expr(n.left)}, {self.expr(n.right)})")
+            if op == "^":
+                return self.simp(f"ieor({self.expr(n.left)}, {self.expr(n.right)})")
+            if op == "<<":
+                return self.simp(f"ishft({self.expr(n.left)}, {self.expr(n.right)})")
+            if op == ">>":
+                return self.simp(f"ishft({self.expr(n.left)}, -({self.expr(n.right)}))")
             return self.simp(f"({self.expr(n.left)} {op_map.get(op, op)} {self.expr(n.right)})")
         if isinstance(n, c_ast.InitList):
             vals = n.exprs or []
@@ -948,6 +1169,11 @@ class Emitter:
             return f"{name}({self.expr(idx)}+1)"
         if isinstance(n, c_ast.FuncCall):
             fname = self.expr(n.name)
+            # `&arr[i]` (array decay) passed where the callee expects an array
+            # becomes an array section `arr(i+1:)` rather than a scalar element.
+            if isinstance(n.name, c_ast.ID) and n.name.name in self.array_param_funcs and n.args is not None:
+                lowered = self._lower_call_args(n.name.name, n.args.exprs)
+                return f"{n.name.name}({', '.join(lowered)})"
             # _Generic type-selection macro: pick the branch for the argument's
             # static type at translation time.
             if isinstance(n.name, c_ast.ID) and n.name.name.lower() in self.generic_macros:
@@ -973,6 +1199,8 @@ class Emitter:
                 return self.simp(f"sqrt(real({a0}, kind=dp))")
             if fname == "floor":
                 return self.simp(f"floor({args[0]})")
+            if fname in {"pow", "powf", "powl"} and len(args) >= 2:
+                return self.simp(f"({args[0]})**({args[1]})")
             if fname == "creal":
                 return self.simp(f"real({args[0]}, kind=dp)")
             if fname == "cimag":
@@ -1409,28 +1637,62 @@ class Emitter:
             return ".false."
         return "0"
 
+    def _component_value(self, node: c_ast.Node, ftype: str) -> str:
+        """Lower one struct-component initializer, recursing into nested structs
+        and array-valued components."""
+        m = re.match(r"^type\(([^)]+)\)$", ftype, re.IGNORECASE)
+        if m is not None and isinstance(node, c_ast.InitList) and m.group(1).lower() in self.struct_defs:
+            return self._struct_constructor(m.group(1), node)
+        real_target = ftype.lower().startswith("real")
+        if isinstance(node, c_ast.InitList):
+            vals = ", ".join(self._init_elem_expr(x, real_target) for x in self._flatten_init_list(node))
+            return f"[{vals}]"
+        return self._init_elem_expr(node, real_target)
+
     def _struct_constructor(self, type_name: str, init: c_ast.InitList) -> str:
         """Build a Fortran structure constructor from a C struct initializer.
 
-        Handles both positional (`{1, 2}`) and designated (`{.a = 1}`) forms;
-        designated fields are placed in declaration order and any omitted field
-        is filled with a type-appropriate zero.
+        Handles positional (`{1, 2}`) and designated (`{.a = 1}`) forms, plus
+        nested struct and array-valued components; omitted designated fields are
+        filled with a type-appropriate zero.
         """
         exprs = init.exprs or []
         sdef = self.struct_defs.get(type_name.lower())
-        is_designated = any(isinstance(e, c_ast.NamedInitializer) for e in exprs)
-        if not is_designated or sdef is None:
+        if sdef is None:
             values = ", ".join(self.expr(v) for v in exprs)
             return f"{type_name}({values})"
-        field_vals: Dict[str, str] = {}
-        for e in exprs:
-            if isinstance(e, c_ast.NamedInitializer) and e.name and isinstance(e.name[0], c_ast.ID):
-                field_vals[e.name[0].name.lower()] = self.expr(e.expr)
-        ordered = [
-            field_vals.get(fname.lower(), self._zero_literal(ftype))
-            for fname, ftype, _shape in sdef.fields
-        ]
+        if any(isinstance(e, c_ast.NamedInitializer) for e in exprs):
+            field_vals: Dict[str, str] = {}
+            ftype_by_name = {fn.lower(): ft for fn, ft, _ in sdef.fields}
+            for e in exprs:
+                if isinstance(e, c_ast.NamedInitializer) and e.name and isinstance(e.name[0], c_ast.ID):
+                    fn = e.name[0].name.lower()
+                    field_vals[fn] = self._component_value(e.expr, ftype_by_name.get(fn, "integer"))
+            ordered = [
+                field_vals.get(fname.lower(), self._zero_literal(ftype))
+                for fname, ftype, _shape in sdef.fields
+            ]
+        else:
+            ordered = [
+                self._component_value(v, ftype)
+                for (fname, ftype, _shape), v in zip(sdef.fields, exprs)
+            ]
         return f"{type_name}({', '.join(ordered)})"
+
+    def _emit_fopen(self, lhs: str, fc: c_ast.FuncCall) -> bool:
+        """Emit `open(newunit=...)` for a C fopen call. Returns True if emitted."""
+        args = fc.args.exprs if fc.args is not None else []
+        if len(args) < 2:
+            return False
+        fexpr = self.expr(args[0])
+        mode = self.expr(args[1]).strip().strip('"').strip("'").lower()
+        if "w" in mode:
+            self.emit(f'open(newunit={lhs}, file={fexpr}, status="replace", action="write")')
+        elif "r" in mode:
+            self.emit(f'open(newunit={lhs}, file={fexpr}, status="old", action="read")')
+        else:
+            self.emit(f'open(newunit={lhs}, file={fexpr})')
+        return True
 
     def emit_assignment(self, st: c_ast.Assignment, *, array_result_name: Optional[str] = None) -> None:
         if st.op == "=" and isinstance(st.rvalue, c_ast.UnaryOp) and st.rvalue.op in ("p++", "p--", "++", "--"):
@@ -1480,8 +1742,15 @@ class Emitter:
             malloc_fc = st.rvalue.expr
         elif isinstance(st.rvalue, c_ast.FuncCall):
             malloc_fc = st.rvalue
-        if malloc_fc is not None and isinstance(malloc_fc.name, c_ast.ID) and malloc_fc.name.name in ("malloc", "realloc"):
+        if malloc_fc is not None and isinstance(malloc_fc.name, c_ast.ID) and malloc_fc.name.name in ("malloc", "realloc", "calloc"):
             fc = malloc_fc
+            if isinstance(fc.name, c_ast.ID) and fc.name.name == "calloc" and fc.args is not None and fc.args.exprs:
+                # calloc(count, size) -> allocate + zero-initialise.
+                n = self._malloc_count_expr(fc.args.exprs[0])
+                lhs = self.expr(st.lvalue)
+                self.emit(f"allocate({lhs}({n}))")
+                self.emit(f"{lhs} = 0")
+                return
             if isinstance(fc.name, c_ast.ID) and fc.name.name == "realloc" and fc.args is not None and len(fc.args.exprs) >= 2:
                 lhs = self.expr(st.lvalue)
                 size_arg = fc.args.exprs[1]
@@ -1506,17 +1775,7 @@ class Emitter:
                 return
         # fopen -> open(newunit=...)
         if isinstance(st.rvalue, c_ast.FuncCall) and isinstance(st.rvalue.name, c_ast.ID) and st.rvalue.name.name == "fopen":
-            args = st.rvalue.args.exprs if st.rvalue.args is not None else []
-            if len(args) >= 2:
-                lhs = self.expr(st.lvalue)
-                fexpr = self.expr(args[0])
-                mode = self.expr(args[1]).strip().strip('"').strip("'").lower()
-                if "w" in mode:
-                    self.emit(f'open(newunit={lhs}, file={fexpr}, status="replace", action="write")')
-                elif "r" in mode:
-                    self.emit(f'open(newunit={lhs}, file={fexpr}, status="old", action="read")')
-                else:
-                    self.emit(f'open(newunit={lhs}, file={fexpr})')
+            if self._emit_fopen(self.expr(st.lvalue), st.rvalue):
                 return
 
         # Special array-result function calls:
@@ -1726,10 +1985,24 @@ class Emitter:
             if st.init is not None:
                 info = self.var_infos.get((st.name or "").lower())
                 if isinstance(st.init, c_ast.InitList) and info is not None and info.shape:
+                    struct_elem = re.match(r"^type\(([^)]+)\)$", info.ftype, re.IGNORECASE)
+                    if struct_elem is not None and struct_elem.group(1).lower() in self.struct_defs:
+                        # Array of structs: build a per-element constructor list.
+                        elems = [
+                            self._struct_constructor(struct_elem.group(1), e)
+                            if isinstance(e, c_ast.InitList) else self.expr(e)
+                            for e in (st.init.exprs or [])
+                        ]
+                        self.emit(f"{st.name} = [{', '.join(elems)}]")
+                        return
                     flat_values = self._flatten_init_list(st.init)
-                    values = ", ".join(self.expr(value) for value in flat_values)
+                    real_target = info.ftype.lower().startswith("real")
+                    values = ", ".join(self._init_elem_expr(value, real_target) for value in flat_values)
                     shape = ", ".join(info.shape)
-                    self.emit(f"{st.name} = reshape([{values}], [{shape}])")
+                    if len(info.shape) == 1:
+                        self.emit(f"{st.name} = [{values}]")
+                    else:
+                        self.emit(f"{st.name} = reshape([{values}], [{shape}])")
                     return
                 if isinstance(st.init, c_ast.InitList) and info is not None:
                     struct_match = re.match(r"^type\(([^)]+)\)$", info.ftype, re.IGNORECASE)
@@ -1755,6 +2028,14 @@ class Emitter:
                     n = self._malloc_count_expr(arg)
                     self.emit(f"allocate({st.name}({n}))")
                     return
+                if init_fc is not None and isinstance(init_fc.name, c_ast.ID) and init_fc.name.name == "calloc" and init_fc.args is not None and init_fc.args.exprs:
+                    n = self._malloc_count_expr(init_fc.args.exprs[0])
+                    self.emit(f"allocate({st.name}({n}))")
+                    self.emit(f"{st.name} = 0")
+                    return
+                if isinstance(st.init, c_ast.FuncCall) and isinstance(st.init.name, c_ast.ID) and st.init.name.name == "fopen":
+                    if self._emit_fopen(st.name, st.init):
+                        return
                 if isinstance(st.init, c_ast.FuncCall) and isinstance(st.init.name, c_ast.ID):
                     fname = st.init.name.name
                     if fname in self.array_result_funcs and st.init.args is not None:
@@ -1817,22 +2098,22 @@ class Emitter:
                 isinstance(cond, c_ast.BinaryOp)
                 and cond.op == "=="
                 and isinstance(cond.right, c_ast.Constant)
-                and cond.right.value == "1"
                 and isinstance(cond.left, c_ast.FuncCall)
                 and isinstance(cond.left.name, c_ast.ID)
                 and cond.left.name.name == "fscanf"
                 and cond.left.args is not None
                 and len(cond.left.args.exprs) >= 3
+                and str(cond.right.value).strip().isdigit()
+                and int(cond.right.value) == len(cond.left.args.exprs) - 2
             ):
                 fp_expr = self.expr(cond.left.args.exprs[0])
-                read_arg = cond.left.args.exprs[2]
-                read_target = self.expr(read_arg)
+                read_targets = ", ".join(self.expr(a) for a in cond.left.args.exprs[2:])
                 self.emit("block")
                 self.indent += 3
                 self.emit("integer :: ios")
                 self.emit("do")
                 self.indent += 3
-                self.emit(f"read({fp_expr}, *, iostat=ios) {read_target}")
+                self.emit(f"read({fp_expr}, *, iostat=ios) {read_targets}")
                 self.emit("if (ios /= 0) exit")
                 self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
                 self.indent -= 3
@@ -1874,6 +2155,16 @@ class Emitter:
                 else:
                     self.emit("write(*,*)")
                 return
+            if isinstance(st.name, c_ast.ID) and st.name.name in ("exit", "_Exit", "abort"):
+                args = st.args.exprs if st.args is not None else []
+                code = self.expr(args[0]) if args else "0"
+                self.emit(f"stop {code}" if code.strip() not in ("", "0") else "stop")
+                return
+            if isinstance(st.name, c_ast.ID) and st.name.name in ("putchar", "putc"):
+                args = st.args.exprs if st.args is not None else []
+                if args:
+                    self.emit(f"write(*, '(a)', advance=\"no\") {self.expr(args[0])}")
+                return
             if isinstance(st.name, c_ast.ID) and st.name.name == "srand":
                 # deterministic seed handled by generated Fortran runtime defaults
                 return
@@ -1895,7 +2186,9 @@ class Emitter:
                         return
                     self.emit(f"if (allocated({v})) deallocate({v})")
                 return
-            self.emit(f"call {self.expr(st.name)}({', '.join(self.expr(a) for a in (st.args.exprs if st.args else []))})")
+            call_name = st.name.name if isinstance(st.name, c_ast.ID) else self.expr(st.name)
+            call_args = self._lower_call_args(call_name, st.args.exprs if st.args else [])
+            self.emit(f"call {self.expr(st.name)}({', '.join(call_args)})")
             return
         if isinstance(st, c_ast.UnaryOp):
             if st.op in {"p++", "++"}:
@@ -2145,8 +2438,11 @@ def emit_function(
             p.name, p_ft, intent=intent, is_array=is_array_dummy
         )
         if p_ptr_or_arr and is_array_dummy:
-            em.emit(add_inline_comment(f"{p_ft}, {intent} :: {p.name}(:)", inline_doc))
-            em.pointer_like_names.add(p.name.lower())
+            rank = max(1, dummy_array_rank(p.type))
+            dims = ", ".join([":"] * rank)
+            em.emit(add_inline_comment(f"{p_ft}, {intent} :: {p.name}({dims})", inline_doc))
+            if rank == 1:
+                em.pointer_like_names.add(p.name.lower())
         else:
             em.emit(add_inline_comment(f"{p_ft}, {intent} :: {p.name}", inline_doc))
     if out_idx is not None and out_param_name is not None:
@@ -2348,6 +2644,7 @@ def transpile_c_to_fortran(
     src = normalize_c_complex_types(
         normalize_fortran_d_exponents(strip_preprocessor_and_comments(text))
     )
+    src = expand_function_macros(src, collect_func_macros(text))
     parser = c_parser.CParser()
     ast = parser.parse(PRELUDE + "\n" + src)
     real_prec = _detect_c_real_precision(src)
@@ -2389,6 +2686,18 @@ def transpile_c_to_fortran(
         define_constants=define_constants,
         generic_macros=generic_macros,
     )
+    for ext in ast.ext:
+        if not isinstance(ext, c_ast.FuncDef) or not isinstance(ext.decl.type, c_ast.FuncDecl):
+            continue
+        fdecl = ext.decl.type
+        fparams = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)] if fdecl.args else []
+        idxs = {
+            idx for idx, p in enumerate(fparams)
+            if p.name and type_is_ptr_or_array(p.type) and has_array_ref_of(ext.body, p.name)
+        }
+        if idxs:
+            em.array_param_funcs[ext.decl.name] = idxs
+
     funcs = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name != "main"]
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
     uses_rand = bool(collect_called_names(ast, {"rand"}))
@@ -2410,9 +2719,48 @@ def transpile_c_to_fortran(
                 if tname in struct_defs:
                     main_needed_types.add(tname)
 
-    # Emit a module whenever there are module procedures, a rand() helper, or
-    # struct type definitions (which main and other units share).
-    if funcs or uses_rand or struct_defs:
+    # Pull in struct types referenced transitively (nested components) so their
+    # constructors resolve in main.
+    pending = list(main_needed_types)
+    while pending:
+        cur = pending.pop()
+        sdef = struct_defs.get(cur)
+        if sdef is None:
+            continue
+        for _fn, ft, _sh in sdef.fields:
+            mt = re.match(r"^type\(([^)]+)\)$", ft, re.IGNORECASE)
+            if mt is not None:
+                dep = mt.group(1).lower()
+                if dep in struct_defs and dep not in main_needed_types:
+                    main_needed_types.add(dep)
+                    pending.append(dep)
+
+    # File-scope variables become shared module variables.
+    global_vars: List[Tuple[str, str, Optional[str], Optional[Tuple[str, ...]]]] = []
+    gvar_names: Set[str] = set()
+    for ext in ast.ext:
+        if not isinstance(ext, c_ast.Decl) or not ext.name:
+            continue
+        if isinstance(ext.type, (c_ast.FuncDecl, c_ast.Struct, c_ast.Union, c_ast.Enum)):
+            continue
+        gftype, _galloc = c_to_ftype(ext.type)
+        if gftype == "void":
+            continue
+        vinfo_map: Dict[str, VarInfo] = {}
+        gather_decls(ext, vinfo_map)
+        gshape = vinfo_map.get(ext.name).shape if vinfo_map.get(ext.name) else None
+        ginit = None
+        if ext.init is not None and not isinstance(ext.init, c_ast.InitList):
+            ginit = em.expr(ext.init)
+        global_vars.append((ext.name, gftype, ginit, gshape))
+        gvar_names.add(ext.name)
+    main_used_gvars = sorted(
+        n for n in gvar_names if any(ast_uses_any_id(m.body, {n}) for m in mains)
+    )
+
+    # Emit a module whenever there are module procedures, a rand() helper,
+    # struct type definitions, or shared global variables.
+    if funcs or uses_rand or struct_defs or global_vars:
         em.emit("module xc2f_mod")
         em.emit("implicit none")
         em.emit("private")
@@ -2423,6 +2771,7 @@ def transpile_c_to_fortran(
         else:
             publics = sorted(module_proc_names)
         publics.extend(sorted(struct_defs.keys()))
+        publics.extend(sorted(gvar_names))
         publics = sorted(set(publics))
         if publics:
             em.emit(f"public :: {', '.join(publics)}")
@@ -2438,6 +2787,16 @@ def transpile_c_to_fortran(
                         em.emit(f"   {ftype} :: {fname}")
                 em.emit(f"end type {sdef.name}")
                 em.emit("")
+        if global_vars:
+            em.emit("")
+            for gname, gftype, ginit, gshape in global_vars:
+                decl = f"{gftype} :: {gname}"
+                if gshape:
+                    decl = f"{gftype} :: {gname}({', '.join(gshape)})"
+                if ginit is not None:
+                    decl += f" = {ginit}"
+                em.emit(decl)
+            em.emit("")
         if funcs or uses_rand:
             em.emit("contains")
             em.emit("")
@@ -2455,7 +2814,7 @@ def transpile_c_to_fortran(
         em.emit("end module xc2f_mod")
         em.emit("")
 
-    main_use_names = sorted(set(main_called_module_names) | set(main_needed_types))
+    main_use_names = sorted(set(main_called_module_names) | set(main_needed_types) | set(main_used_gvars))
     if main_uses_rand:
         main_use_names.append("rand")
     for ext in mains:
@@ -2700,6 +3059,26 @@ def _build_only_cmd(cmd: List[str], *, label: str) -> bool:
             print(cp.stderr.rstrip())
         return False
     print(f"Build ({label}): PASS")
+    return True
+
+
+def _requested_actions_succeeded(
+    args: argparse.Namespace,
+    *,
+    original_run_ok: bool,
+    original_build_ok: bool,
+    fortran_run_ok: bool,
+    fortran_build_ok: bool,
+) -> bool:
+    """Return whether every build/run action requested on the CLI succeeded."""
+    if args.run_both:
+        return original_run_ok and fortran_run_ok
+    if args.run:
+        return fortran_run_ok
+    if args.compile_both or args.compile_both_c:
+        return original_build_ok and fortran_build_ok
+    if args.compile_c:
+        return fortran_build_ok
     return True
 
 
@@ -3675,12 +4054,20 @@ def main() -> int:
             t_f = _time_executable(f_exe, label="transformed-fortran")
             if t_c is not None and t_f is not None and t_c > 0:
                 print(f"Time ratio (fortran/c): {t_f / t_c:.3f}")
-        return 0
+        actions_ok = _requested_actions_succeeded(
+            args,
+            original_run_ok=orig_ok,
+            original_build_ok=orig_build_ok,
+            fortran_run_ok=new_ok,
+            fortran_build_ok=new_build_ok,
+        )
+        return 0 if actions_ok else 1
 
     # mode each
     if args.out_dir is not None:
         args.out_dir.mkdir(parents=True, exist_ok=True)
     fail_count = 0
+    all_actions_ok = True
     for c_file in args.c_files:
         text = c_file.read_text(encoding="utf-8", errors="ignore")
         try:
@@ -3746,6 +4133,7 @@ def main() -> int:
         if args.maxfail is not None and orig_build_ok and not new_build_ok:
             fail_count += 1
             if fail_count >= args.maxfail:
+                all_actions_ok = False
                 print(f"Stopped at maxfail={args.maxfail} (C built, Fortran did not).")
                 break
         if args.run_diff and args.run_both and orig_ok and new_ok:
@@ -3768,7 +4156,15 @@ def main() -> int:
             t_f = _time_executable(f_exe, label="transformed-fortran")
             if t_c is not None and t_f is not None and t_c > 0:
                 print(f"Time ratio (fortran/c): {t_f / t_c:.3f}")
-    return 0
+        case_actions_ok = _requested_actions_succeeded(
+            args,
+            original_run_ok=orig_ok,
+            original_build_ok=orig_build_ok,
+            fortran_run_ok=new_ok,
+            fortran_build_ok=new_build_ok,
+        )
+        all_actions_ok = all_actions_ok and case_actions_ok
+    return 0 if all_actions_ok else 1
 
 
 if __name__ == "__main__":
