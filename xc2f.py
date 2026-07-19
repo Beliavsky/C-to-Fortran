@@ -1024,20 +1024,34 @@ def is_forwarded_to_array_parameter(
     node: c_ast.Node,
     name: str,
     array_param_funcs: Dict[str, Set[int]],
+    *,
+    include_struct_components: bool = False,
 ) -> bool:
     """Return whether `name` is passed to a known array dummy parameter."""
-    target = name.lower()
+    def contains_struct_ref(expr: c_ast.Node) -> bool:
+        if isinstance(expr, c_ast.StructRef):
+            return True
+        return any(
+            isinstance(child, c_ast.Node) and contains_struct_ref(child)
+            for _key, child in expr.children()
+        )
+
     if isinstance(node, c_ast.FuncCall) and isinstance(node.name, c_ast.ID) and node.args is not None:
         array_indices = array_param_funcs.get(node.name.name, set())
         for idx, arg in enumerate(node.args.exprs):
             if idx not in array_indices:
                 continue
             base = arg.expr if isinstance(arg, c_ast.UnaryOp) and arg.op == "&" else arg
-            if isinstance(base, c_ast.ID) and base.name.lower() == target:
+            if contains_struct_ref(base) and not include_struct_components:
+                continue
+            if _is_dummy_target_expr(base, name):
                 return True
     for _key, child in node.children():
         if isinstance(child, c_ast.Node) and is_forwarded_to_array_parameter(
-            child, name, array_param_funcs
+            child,
+            name,
+            array_param_funcs,
+            include_struct_components=include_struct_components,
         ):
             return True
     return False
@@ -1138,6 +1152,9 @@ class Emitter:
         self.define_constants: Dict[str, Tuple[str, str]] = define_constants or {}
         self.generic_macros: Dict[str, Dict[str, str]] = generic_macros or {}
         self.array_param_funcs: Dict[str, Set[int]] = {}
+        # Function name -> dummy indices written either directly or through a
+        # chain of calls. Used to propagate Fortran INTENT requirements.
+        self.writable_param_funcs: Dict[str, Set[int]] = {}
         # Names of scalar C strings in the current unit: indexing them uses
         # substrings and '\0' comparisons become length checks.
         self.char_string_names: Set[str] = set()
@@ -1436,7 +1453,19 @@ class Emitter:
                     return f"(.not. allocated({self.expr(n.expr)}))"
                 if isinstance(n.expr, c_ast.ID):
                     return self.simp(f"({self.expr(n.expr)} == 0)")
-                return self.simp(f".not. ({self.expr(n.expr)})")
+                if (
+                    isinstance(n.expr, c_ast.FuncCall)
+                    and isinstance(n.expr.name, c_ast.ID)
+                    and n.expr.name.name == "isfinite"
+                ):
+                    return self.simp(f".not. ({self.expr(n.expr)})")
+                if isinstance(n.expr, c_ast.BinaryOp) and n.expr.op in {
+                    "==", "!=", "<", "<=", ">", ">=", "&&", "||"
+                }:
+                    return self.simp(f".not. ({self.cond_expr(n.expr)})")
+                # C functions and arithmetic expressions are numeric truth
+                # values; Fortran's .not. accepts only LOGICAL operands.
+                return self.simp(f"({self.expr(n.expr)} == 0)")
             if op == "~":
                 return self.simp(f"not({self.expr(n.expr)})")
         if isinstance(n, c_ast.BinaryOp):
@@ -1585,6 +1614,8 @@ class Emitter:
                 args = [self.expr(a) for a in n.args.exprs]
             if fname in {"fabs", "fabsf", "fabsl"} and len(args) >= 1:
                 return self.simp(f"abs({args[0]})")
+            if fname == "isfinite" and len(args) == 1:
+                return f"ieee_is_finite({args[0]})"
             if fname == "strlen" and len(args) == 1:
                 return self.simp(f"len_trim({args[0]})")
             if fname == "strcmp" and len(args) == 2:
@@ -3099,6 +3130,12 @@ def emit_function(
     if fdecl.args is not None:
         params = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)]
     need_ieee_consts = ast_uses_any_id(fn.body, {"NAN", "INFINITY", "HUGE_VAL"})
+    need_ieee_finite = bool(collect_called_names(fn.body, {"isfinite"}))
+    ieee_imports: List[str] = []
+    if need_ieee_consts:
+        ieee_imports.extend(["ieee_value", "ieee_quiet_nan", "ieee_positive_inf"])
+    if need_ieee_finite:
+        ieee_imports.append("ieee_is_finite")
     is_recursive = name in collect_called_names(fn.body, {name})
 
     need_int64 = ast_uses_any_id(fn.body, {"UINT_MAX", "LONG_MAX"}) or _body_has_unsigned_locals(fn.body)
@@ -3110,8 +3147,8 @@ def emit_function(
         em.emit("use, intrinsic :: iso_fortran_env, only: real64")
         if need_int64:
             em.emit("use, intrinsic :: iso_fortran_env, only: int64")
-        if need_ieee_consts:
-            em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
+        if ieee_imports:
+            em.emit(f"use, intrinsic :: ieee_arithmetic, only: {', '.join(ieee_imports)}")
         em.emit("implicit none")
         for enum_name, enum_value in em.enum_constants.items():
             em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
@@ -3251,8 +3288,8 @@ def emit_function(
     em.emit("use, intrinsic :: iso_fortran_env, only: real64")
     if need_int64:
         em.emit("use, intrinsic :: iso_fortran_env, only: int64")
-    if need_ieee_consts:
-        em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
+    if ieee_imports:
+        em.emit(f"use, intrinsic :: ieee_arithmetic, only: {', '.join(ieee_imports)}")
     for enum_name, enum_value in em.enum_constants.items():
         em.emit(f"integer, parameter :: {enum_name} = {enum_value}")
     _fn_locals: Dict[str, VarInfo] = {}
@@ -3289,6 +3326,8 @@ def emit_function(
             intent = "intent(in)"
         else:
             has_read, has_write = _scan_dummy_usage(fn.body, p.name)
+            if idx in em.writable_param_funcs.get(name, set()):
+                has_write = True
             first_read, first_write = _dummy_first_read_write_line(fn.body, p.name)
             if has_write and (not has_read or (first_write is not None and (first_read is None or first_write < first_read))):
                 intent = "intent(out)"
@@ -3632,6 +3671,13 @@ def transpile_c_to_fortran(
         }
         if idxs:
             em.array_param_funcs[ext.decl.name] = idxs
+        writable_idxs = {
+            idx
+            for idx, p in enumerate(fparams)
+            if p.name and _scan_dummy_usage(ext.body, p.name)[1]
+        }
+        if writable_idxs:
+            em.writable_param_funcs[ext.decl.name] = writable_idxs
 
     # Propagate array rank through forwarding wrappers. A parameter may never
     # be indexed in its own function but still be passed to another function's
@@ -3652,14 +3698,72 @@ def transpile_c_to_fortran(
                     idxs.add(idx)
                     changed = True
 
+    # Propagate writes through wrapper calls just as array rank is propagated.
+    # A caller dummy forwarded to an OUT/INOUT callee cannot remain INTENT(IN).
+    changed = True
+    while changed:
+        changed = False
+        for ext in ast.ext:
+            if not isinstance(ext, c_ast.FuncDef) or not isinstance(ext.decl.type, c_ast.FuncDecl):
+                continue
+            fdecl = ext.decl.type
+            fparams = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)] if fdecl.args else []
+            writable_idxs = em.writable_param_funcs.setdefault(ext.decl.name, set())
+            for idx, p in enumerate(fparams):
+                if idx in writable_idxs or not p.name:
+                    continue
+                if is_forwarded_to_array_parameter(
+                    ext.body,
+                    p.name,
+                    em.writable_param_funcs,
+                    include_struct_components=True,
+                ):
+                    writable_idxs.add(idx)
+                    changed = True
+
     funcs = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name != "main"]
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
+    externally_visible_func_names = {
+        e.decl.name for e in funcs if "static" not in (e.decl.storage or [])
+    }
     # qsort comparators take const void* arguments, which have no value-level
     # translation; qsort calls become a generated sort helper and the
     # comparator functions are dropped.
     funcs = [e for e in funcs if not _has_void_ptr_param(e)]
+    if mains:
+        # A standalone C program may contain unused static helpers. Emitting
+        # them as private module procedures trips -Werror=unused-function, so
+        # retain only the transitive call graph rooted at main (including
+        # functions passed by name as function-pointer arguments).
+        funcs_by_name = {e.decl.name: e for e in funcs}
+        candidate_names = set(funcs_by_name)
+        reachable: Set[str] = set()
+        pending_funcs: List[str] = []
+        for main_fn in mains:
+            roots = collect_called_names(main_fn.body, candidate_names)
+            roots.update(
+                fname for fname in candidate_names if ast_uses_any_id(main_fn.body, {fname})
+            )
+            pending_funcs.extend(roots)
+        while pending_funcs:
+            fname = pending_funcs.pop()
+            if fname in reachable or fname not in funcs_by_name:
+                continue
+            reachable.add(fname)
+            body = funcs_by_name[fname].body
+            callees = collect_called_names(body, candidate_names)
+            callees.update(
+                other for other in candidate_names if ast_uses_any_id(body, {other})
+            )
+            pending_funcs.extend(callees - reachable)
+        funcs = [
+            e
+            for e in funcs
+            if e.decl.name in reachable or e.decl.name in externally_visible_func_names
+        ]
     qsort_kinds = _collect_qsort_elem_kinds(ast)
-    uses_rand = bool(collect_called_names(ast, {"rand"}))
+    retained_units = funcs + mains
+    uses_rand = any(collect_called_names(unit.body, {"rand"}) for unit in retained_units)
     main_uses_rand = any(collect_called_names(m, {"rand"}) for m in mains)
     uses_argv = False
     for m in mains:
@@ -3772,6 +3876,9 @@ def transpile_c_to_fortran(
         em.emit("private")
         if mains:
             publics = sorted(set(main_called_module_names) | set(main_needed_types))
+            publics.extend(
+                sorted(externally_visible_func_names & {e.decl.name for e in funcs})
+            )
             if main_uses_rand:
                 publics.append("rand")
             if uses_argv:
