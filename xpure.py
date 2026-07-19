@@ -674,6 +674,13 @@ def analyze_lines(
                         character_names.update(declared)
                     intent_attr = parse_decl_intent(low)
                     has_value_attr = decl_has_value_attr(low, declared)
+                    if re.search(r"\bpointer\b", low):
+                        pointer_dummies = declared & proc.dummy_names
+                        for d in sorted(pointer_dummies):
+                            reasons.append(
+                                f"line {ln}: dummy argument '{d}' has POINTER attribute "
+                                "(conservatively treated as non-pure candidate)"
+                            )
                     if intent_attr or has_value_attr:
                         for d in proc.dummy_names:
                             if d in declared:

@@ -78,6 +78,26 @@ DEFAULT_GFORTRAN_FLAGS = [
     "-fmodule-private",
 ]
 
+DEBUG_GFORTRAN_FLAGS = [
+    "-O0",
+    "-g",
+    "-fbacktrace",
+    "-fcheck=all",
+    "-ffpe-trap=invalid,zero,overflow",
+    "-finit-real=snan",
+    "-finit-integer=-999999",
+]
+
+
+def gfortran_flags(*, debug: bool = False) -> List[str]:
+    """Return compiler flags, adding full runtime diagnostics for --debug."""
+    flags = list(DEFAULT_GFORTRAN_FLAGS)
+    if debug:
+        for flag in DEBUG_GFORTRAN_FLAGS:
+            if flag not in flags:
+                flags.append(flag)
+    return flags
+
 PRELUDE_LINE_COUNT = len(PRELUDE.splitlines())
 
 
@@ -2561,6 +2581,15 @@ class Emitter:
         if isinstance(st, c_ast.Decl):
             # declarations already hoisted
             if st.init is not None:
+                if (
+                    st.name
+                    and st.name.lower() in self.alias_map
+                    and isinstance(st.init, c_ast.UnaryOp)
+                    and st.init.op == "&"
+                    and isinstance(st.init.expr, c_ast.ArrayRef)
+                ):
+                    # Pointer view aliases are substituted directly at uses.
+                    return
                 info = self.var_infos.get((st.name or "").lower())
                 if info is not None and info.struct_ptr:
                     init = st.init.expr if isinstance(st.init, c_ast.Cast) else st.init
@@ -3065,6 +3094,39 @@ def _register_realloc_aliases(em: Emitter, body: c_ast.Node, locals_map: Dict[st
     visit(body)
 
 
+def _register_pointer_section_aliases(
+    em: Emitter,
+    body: c_ast.Node,
+    locals_map: Dict[str, VarInfo],
+) -> None:
+    """Fold `T *p = &array[offset]` into a Fortran array-section alias.
+
+    A copied allocatable local is not equivalent to a C pointer view and, with
+    runtime checks enabled, assigning a scalar element to that unallocated
+    local fails immediately. Substituting `p` with `array(offset+1:)` preserves
+    the intended view without requiring a temporary allocation.
+    """
+
+    def visit(node: c_ast.Node) -> None:
+        if isinstance(node, c_ast.Decl) and node.name and node.init is not None:
+            init = node.init.expr if isinstance(node.init, c_ast.Cast) else node.init
+            if (
+                isinstance(init, c_ast.UnaryOp)
+                and init.op == "&"
+                and isinstance(init.expr, c_ast.ArrayRef)
+            ):
+                array_ref = init.expr
+                base = em.expr(array_ref.name)
+                offset = em.expr(array_ref.subscript)
+                em.alias_map[node.name.lower()] = f"{base}(({offset})+1:)"
+                locals_map.pop(node.name, None)
+        for _key, child in node.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(body)
+
+
 def emit_argv_helper(em: Emitter) -> None:
     """Emit argv_value(pos): the pos-th command-line argument as a string."""
     em.emit("function argv_value(pos) result(argv_value_result)")
@@ -3156,6 +3218,7 @@ def emit_function(
         locals_map: Dict[str, VarInfo] = {}
         gather_decls(fn.body, locals_map)
         _register_realloc_aliases(em, fn.body, locals_map)
+        _register_pointer_section_aliases(em, fn.body, locals_map)
         _demote_nonarray_pointer_locals(em, fn.body, locals_map)
         _register_funcptr_arrays(em, fn.body, locals_map)
         # C main(argc, argv): argc maps onto command_argument_count()+1 (the
@@ -3373,6 +3436,7 @@ def emit_function(
     locals_map: Dict[str, VarInfo] = {}
     gather_decls(fn.body, locals_map)
     _register_realloc_aliases(em, fn.body, locals_map)
+    _register_pointer_section_aliases(em, fn.body, locals_map)
     _demote_nonarray_pointer_locals(em, fn.body, locals_map)
     _register_funcptr_arrays(em, fn.body, locals_map)
     em.var_infos = {k.lower(): v for k, v in locals_map.items()}
@@ -3427,12 +3491,9 @@ def emit_function(
     em.var_infos = {}
 
 
-# C identifiers that would collide with Fortran statement keywords in emitted
-# positions (e.g. a C function literally named `function`).
-_FORTRAN_UNIT_KEYWORDS: Set[str] = {
-    "function", "subroutine", "result", "program", "contains", "end",
-    "block", "interface", "procedure", "module",
-}
+# C identifiers that conflict with Fortran syntax or commonly shadowed
+# intrinsics. Keep this shared with the post-emission Fortran scanner.
+_FORTRAN_IDENTIFIER_CONFLICTS: Set[str] = set(fscan.FORTRAN_RESERVED_IDENTIFIERS)
 
 
 def rename_ast_identifiers(node: c_ast.Node, mapping: Dict[str, str]) -> None:
@@ -3447,20 +3508,88 @@ def rename_ast_identifiers(node: c_ast.Node, mapping: Dict[str, str]) -> None:
 
 
 def collect_keyword_collision_renames(ast_root: c_ast.FileAST) -> Dict[str, str]:
-    """Map C identifiers named like Fortran unit keywords to safe names."""
-    found: Set[str] = set()
+    """Map conflicting C declarations to readable, type-prefixed names.
+
+    Integer-like variables receive ``i``, real variables ``x``, complex
+    variables ``z``, and character variables ``s``. Procedures retain the
+    ``_f`` suffix. Any collision is resolved by appending underscores.
+    """
+    declared_kinds: Dict[str, Set[str]] = defaultdict(set)
+    spellings: Dict[str, Set[str]] = defaultdict(set)
+    used: Set[str] = set()
+
+    def variable_kind(type_node: c_ast.Node) -> str:
+        ftype, _alloc = c_to_ftype(type_node)
+        low = ftype.lower()
+        if low.startswith("integer") or low.startswith("logical"):
+            return "integer"
+        if low.startswith("real"):
+            return "real"
+        if low.startswith("complex"):
+            return "complex"
+        if low.startswith("character"):
+            return "character"
+        return "other"
 
     def visit(node: c_ast.Node) -> None:
-        for attr in ("name", "declname"):
-            v = getattr(node, attr, None)
-            if isinstance(v, str) and v.lower() in _FORTRAN_UNIT_KEYWORDS:
-                found.add(v)
+        # References (ID nodes) are renamed later from the declaration map.
+        # Do not discover names from bare calls such as exit(), which may have
+        # no declaration after headers are stripped but still need builtin
+        # lowering. Likewise, ignore declarations injected by PRELUDE.
+        coord = getattr(node, "coord", None)
+        line = getattr(coord, "line", None) if coord is not None else None
+        from_prelude = isinstance(line, int) and line <= PRELUDE_LINE_COUNT
+        if not from_prelude:
+            for attr in ("name", "declname"):
+                value = getattr(node, attr, None)
+                if isinstance(value, str):
+                    used.add(value.lower())
+        if not from_prelude and isinstance(node, c_ast.Decl) and node.name:
+            low_name = node.name.lower()
+            if low_name in _FORTRAN_IDENTIFIER_CONFLICTS:
+                kind = "procedure" if isinstance(node.type, c_ast.FuncDecl) else variable_kind(node.type)
+                declared_kinds[low_name].add(kind)
+                spellings[low_name].add(node.name)
+        elif not from_prelude and isinstance(node, c_ast.Typedef):
+            low_name = node.name.lower()
+            if low_name in _FORTRAN_IDENTIFIER_CONFLICTS:
+                declared_kinds[low_name].add("type")
+                spellings[low_name].add(node.name)
+        elif not from_prelude and isinstance(node, c_ast.Enumerator):
+            low_name = node.name.lower()
+            if low_name in _FORTRAN_IDENTIFIER_CONFLICTS:
+                declared_kinds[low_name].add("integer")
+                spellings[low_name].add(node.name)
         for _k, child in node.children():
             if isinstance(child, c_ast.Node):
                 visit(child)
 
     visit(ast_root)
-    return {n: f"{n}_f" for n in found}
+    mapping: Dict[str, str] = {}
+    generated = set(used)
+    prefixes = {
+        "integer": "i",
+        "real": "x",
+        "complex": "z",
+        "character": "s",
+    }
+    for low_name in sorted(declared_kinds):
+        kinds = declared_kinds[low_name]
+        kind = next(iter(kinds)) if len(kinds) == 1 else "other"
+        if kind == "procedure":
+            candidate = f"{low_name}_f"
+        elif kind == "type":
+            candidate = f"{low_name}_t"
+        elif kind in prefixes:
+            candidate = f"{prefixes[kind]}{low_name}"
+        else:
+            candidate = f"{low_name}_v"
+        while candidate.lower() in generated or candidate.lower() in _FORTRAN_IDENTIFIER_CONFLICTS:
+            candidate += "_"
+        generated.add(candidate.lower())
+        for original in spellings[low_name]:
+            mapping[original] = candidate
+    return mapping
 
 
 def collect_called_names(node: c_ast.Node, names: Set[str]) -> Set[str]:
@@ -3605,7 +3734,7 @@ def transpile_c_to_fortran(
     *,
     refactor: bool = False,
     raw: bool = False,
-    pure: bool = False,
+    pure: bool = True,
     elemental: bool = False,
 ) -> str:
     no_pp = strip_preprocessor_only(text)
@@ -3846,7 +3975,9 @@ def transpile_c_to_fortran(
                     pending.append(dep)
 
     # File-scope variables become shared module variables.
-    global_vars: List[Tuple[str, str, Optional[str], Optional[Tuple[str, ...]]]] = []
+    global_vars: List[
+        Tuple[str, str, Optional[str], Optional[Tuple[str, ...]], bool]
+    ] = []
     gvar_names: Set[str] = set()
     for ext in ast.ext:
         if not isinstance(ext, c_ast.Decl) or not ext.name:
@@ -3858,11 +3989,14 @@ def transpile_c_to_fortran(
             continue
         vinfo_map: Dict[str, VarInfo] = {}
         gather_decls(ext, vinfo_map)
-        gshape = vinfo_map.get(ext.name).shape if vinfo_map.get(ext.name) else None
+        ginfo = vinfo_map.get(ext.name)
+        gshape = ginfo.shape if ginfo else None
+        galloc = bool(ginfo and ginfo.alloc)
         ginit = None
-        if ext.init is not None and not isinstance(ext.init, c_ast.InitList):
+        init_is_null = isinstance(ext.init, c_ast.ID) and ext.init.name == "NULL"
+        if ext.init is not None and not isinstance(ext.init, c_ast.InitList) and not (galloc and init_is_null):
             ginit = em.expr(ext.init)
-        global_vars.append((ext.name, gftype, ginit, gshape))
+        global_vars.append((ext.name, gftype, ginit, gshape, galloc))
         gvar_names.add(ext.name)
     main_used_gvars = sorted(
         n for n in gvar_names if any(ast_uses_any_id(m.body, {n}) for m in mains)
@@ -3909,9 +4043,11 @@ def transpile_c_to_fortran(
                 em.emit("")
         if global_vars:
             em.emit("")
-            for gname, gftype, ginit, gshape in global_vars:
+            for gname, gftype, ginit, gshape, galloc in global_vars:
                 decl = f"{gftype} :: {gname}"
-                if gshape:
+                if galloc:
+                    decl = f"{gftype}, allocatable :: {gname}(:)"
+                elif gshape:
                     decl = f"{gftype} :: {gname}({', '.join(gshape)})"
                 if ginit is not None:
                     decl += f" = {ginit}"
@@ -4859,26 +4995,42 @@ def apply_dead_store_cleanup(lines: List[str]) -> List[str]:
 
 
 def add_pure_when_possible(lines: List[str]) -> List[str]:
-    """Mark procedures PURE when xpure analyzer classifies them as candidates."""
-    parsed = [ln.rstrip("\r\n") for ln in lines]
-    sanitized: List[str] = []
+    """Mark procedures PURE, propagating purity from callees to callers."""
     if_then_re = re.compile(r"^\s*(?:else\s+)?if\s*\((.*)\)\s*then\b", re.IGNORECASE)
-    for s in parsed:
-        m = if_then_re.match(s)
-        if not m:
-            sanitized.append(s)
-            continue
-        cond = m.group(1)
-        # Avoid xpure's assignment-regex false positives on IF conditions.
-        cond2 = cond.replace("==", ".eq.").replace("/=", ".ne.").replace(">=", ".ge.").replace("<=", ".le.")
-        sanitized.append(s[: m.start(1)] + cond2 + s[m.end(1) :])
-    result = xpure.analyze_lines(sanitized, strict_unknown_calls=False)
-    if not result.candidates:
-        return lines
     updated = list(lines)
-    for proc in result.candidates:
-        idx = proc.start - 1
-        xpure.apply_decl_edit_at_or_continuation(updated, idx, xpure.add_pure_to_declaration)
+
+    while True:
+        parsed = [ln.rstrip("\r\n") for ln in updated]
+        sanitized: List[str] = []
+        for s in parsed:
+            m = if_then_re.match(s)
+            if not m:
+                sanitized.append(s)
+                continue
+            cond = m.group(1)
+            # Avoid xpure's assignment-regex false positives on IF conditions.
+            cond2 = cond.replace("==", ".eq.").replace("/=", ".ne.").replace(">=", ".ge.").replace("<=", ".le.")
+            sanitized.append(s[: m.start(1)] + cond2 + s[m.end(1) :])
+
+        result = xpure.analyze_lines(
+            sanitized,
+            strict_unknown_calls=True,
+            conservative_call_block=False,
+        )
+        if not result.candidates:
+            break
+
+        changed = False
+        for proc in result.candidates:
+            idx = proc.start - 1
+            changed = (
+                xpure.apply_decl_edit_at_or_continuation(
+                    updated, idx, xpure.add_pure_to_declaration
+                )
+                or changed
+            )
+        if not changed:
+            break
     return updated
 
 
@@ -5020,11 +5172,25 @@ def main() -> int:
     ap.add_argument("--tee-both", action="store_true", help="Print original C source and generated Fortran")
     ap.add_argument("--raw", action="store_true", help="Emit raw transpilation output (skip optional post-processing)")
     ap.add_argument("--refactor", action="store_true", help="Extract long main-program blocks into module procedures")
-    ap.add_argument("--pure", action="store_true", help="Allow promotion of eligible procedures to pure")
+    purity_group = ap.add_mutually_exclusive_group()
+    purity_group.add_argument(
+        "--pure",
+        dest="pure",
+        action="store_true",
+        help="Promote eligible procedures to pure (default)",
+    )
+    purity_group.add_argument(
+        "--no-pure",
+        dest="pure",
+        action="store_false",
+        help="Do not promote procedures to pure",
+    )
+    ap.set_defaults(pure=True)
     ap.add_argument("--elemental", action="store_true", help="Allow promotion of eligible pure scalar subroutines to elemental")
     ap.add_argument("--array", action="store_true", help="Post-process generated Fortran with xarray.py")
     ap.add_argument("--array-inline", action="store_true", help="With --array, enable xarray inline post-pass")
     ap.add_argument("--inline-temp", action="store_true", help="Post-process generated Fortran with xno_variable.py")
+    ap.add_argument("--debug", action="store_true", help="Compile Fortran with full runtime checks, debug symbols, floating-point traps, and backtraces")
     ap.add_argument("--run", action="store_true", help="Build and run generated Fortran output")
     ap.add_argument("--run-both", action="store_true", help="Build/run original C source and generated Fortran output")
     ap.add_argument("--compile", action="store_true", help="Build generated Fortran output only (no C build or run)")
@@ -5084,6 +5250,7 @@ def main() -> int:
         args.pure = True
     if args.run_both:
         args.run = True
+    fortran_build_flags = gfortran_flags(debug=args.debug)
 
     def _transpile_text(text: str) -> str:
         fsrc_loc = transpile_c_to_fortran(
@@ -5177,14 +5344,14 @@ def main() -> int:
                 compiler="gfortran",
                 exe_path=f_exe,
                 label="transformed-fortran",
-                extra_args=DEFAULT_GFORTRAN_FLAGS,
+                extra_args=fortran_build_flags,
             )
         elif args.compile_both_c or args.compile_c:
             f_obj = out_path.with_suffix(".o")
-            cmd_f = ["gfortran", "-c", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_obj)]
+            cmd_f = ["gfortran", "-c", str(out_path), *fortran_build_flags, "-o", str(f_obj)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
         elif args.compile or args.compile_both:
-            cmd_f = ["gfortran", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_exe)]
+            cmd_f = ["gfortran", str(out_path), *fortran_build_flags, "-o", str(f_exe)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
         if args.maxfail is not None and orig_build_ok and not new_build_ok:
             print(f"Reached maxfail={args.maxfail} (combined case where C built and Fortran did not).")
@@ -5275,14 +5442,14 @@ def main() -> int:
                 compiler="gfortran",
                 exe_path=f_exe,
                 label="transformed-fortran",
-                extra_args=DEFAULT_GFORTRAN_FLAGS,
+                extra_args=fortran_build_flags,
             )
         elif args.compile_both_c or args.compile_c:
             f_obj = out_path.with_suffix(".o")
-            cmd_f = ["gfortran", "-c", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_obj)]
+            cmd_f = ["gfortran", "-c", str(out_path), *fortran_build_flags, "-o", str(f_obj)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
         elif args.compile or args.compile_both:
-            cmd_f = ["gfortran", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_exe)]
+            cmd_f = ["gfortran", str(out_path), *fortran_build_flags, "-o", str(f_exe)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
         if args.maxfail is not None and orig_build_ok and not new_build_ok:
             fail_count += 1
