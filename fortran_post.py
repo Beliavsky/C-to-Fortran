@@ -1053,6 +1053,12 @@ def inline_temp_into_function_result(lines: List[str]) -> List[str]:
             if "::" in code_k:
                 bad_use = True
                 break
+            # Replacing a DO index with the function result changes both the
+            # returned value and loop bounds, especially for translated
+            # zero-based C loops with an early return.
+            if re.match(rf"^\s*do\s+{re.escape(tmp)}\s*=", code_k, re.IGNORECASE):
+                bad_use = True
+                break
             exec_use_count += len([m for m in ident_re.finditer(code_k) if m.group(0).lower() == tmp])
         if bad_use or exec_use_count == 0:
             i = j + 1

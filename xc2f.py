@@ -132,6 +132,8 @@ _STRUCT_FLEX_MEMBERS: Dict[str, str] = {}
 _STRUCT_RECURSIVE: Set[str] = set()
 # Struct name -> its pointer-component field names.
 _STRUCT_PTR_FIELDS: Dict[str, Set[str]] = {}
+# Struct name -> C pointer fields lowered to allocatable array components.
+_STRUCT_ALLOC_FIELDS: Dict[str, Set[str]] = {}
 
 # Common <limits.h>/<stdint.h> constants lowered to literal values.
 _C_LIMIT_CONSTANTS: Dict[str, str] = {
@@ -661,6 +663,7 @@ def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
     _STRUCT_FLEX_MEMBERS.clear()
     _STRUCT_RECURSIVE.clear()
     _STRUCT_PTR_FIELDS.clear()
+    _STRUCT_ALLOC_FIELDS.clear()
     for ext in ast.ext:
         name: Optional[str] = None
         struct: Optional[c_ast.Node] = None
@@ -693,6 +696,13 @@ def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
                     fields.append((d.name, f"type({name.lower()})", "*"))
                     _STRUCT_RECURSIVE.add(name.lower())
                     _STRUCT_PTR_FIELDS.setdefault(name.lower(), set()).add(d.name.lower())
+                    continue
+                # Ordinary C pointer fields are used as dynamically sized
+                # arrays.  They must retain both rank and allocation status in
+                # the derived type (for example `double *weight`).
+                if _alloc and not ftype.lower().startswith("character"):
+                    fields.append((d.name, ftype, ":"))
+                    _STRUCT_ALLOC_FIELDS.setdefault(name.lower(), set()).add(d.name.lower())
                     continue
             dims: List[str] = []
             type_node = d.type
@@ -1006,6 +1016,29 @@ def has_array_ref_of(node: c_ast.Node, name: str) -> bool:
             return True
     for _k, child in node.children():
         if isinstance(child, c_ast.Node) and has_array_ref_of(child, name):
+            return True
+    return False
+
+
+def is_forwarded_to_array_parameter(
+    node: c_ast.Node,
+    name: str,
+    array_param_funcs: Dict[str, Set[int]],
+) -> bool:
+    """Return whether `name` is passed to a known array dummy parameter."""
+    target = name.lower()
+    if isinstance(node, c_ast.FuncCall) and isinstance(node.name, c_ast.ID) and node.args is not None:
+        array_indices = array_param_funcs.get(node.name.name, set())
+        for idx, arg in enumerate(node.args.exprs):
+            if idx not in array_indices:
+                continue
+            base = arg.expr if isinstance(arg, c_ast.UnaryOp) and arg.op == "&" else arg
+            if isinstance(base, c_ast.ID) and base.name.lower() == target:
+                return True
+    for _key, child in node.children():
+        if isinstance(child, c_ast.Node) and is_forwarded_to_array_parameter(
+            child, name, array_param_funcs
+        ):
             return True
     return False
 
@@ -1399,6 +1432,8 @@ class Emitter:
             if op == "+":
                 return self.simp(f"+({self.expr(n.expr)})")
             if op == "!":
+                if self._is_alloc_entity(n.expr):
+                    return f"(.not. allocated({self.expr(n.expr)}))"
                 if isinstance(n.expr, c_ast.ID):
                     return self.simp(f"({self.expr(n.expr)} == 0)")
                 return self.simp(f".not. ({self.expr(n.expr)})")
@@ -1419,6 +1454,11 @@ class Emitter:
                         if op == "==":
                             return f"(.not. associated({base}))"
                         return f"associated({base})"
+                    if isinstance(other, c_ast.ID) and other.name == "NULL" and self._is_alloc_entity(side):
+                        base = self.expr(side)
+                        if op == "==":
+                            return f"(.not. allocated({base}))"
+                        return f"allocated({base})"
             # C pointer arithmetic used as "tail pointer" argument: a + k
             if op == "+":
                 if self._is_pointer_like_id(n.left):
@@ -1837,12 +1877,18 @@ class Emitter:
                 return True
         return False
 
-    def emit_for(self, st: c_ast.For) -> None:
+    def emit_for(
+        self,
+        st: c_ast.For,
+        *,
+        ret_name: Optional[str] = None,
+        array_result_name: Optional[str] = None,
+    ) -> None:
         # Infinite loop: for(;;) { ... }
         if st.init is None and st.cond is None and st.next is None:
             self.emit("do")
             self.indent += 3
-            self.emit_stmt(st.stmt)
+            self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
             self.indent -= 3
             self.emit("end do")
             return
@@ -1882,9 +1928,9 @@ class Emitter:
                 self._emit_for_init(st.init)
                 self.emit("do")
                 self.indent += 3
-                self.emit_stmt(st.stmt)
+                self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
                 if st.next is not None:
-                    self.emit_stmt(st.next)
+                    self.emit_stmt(st.next, ret_name=ret_name, array_result_name=array_result_name)
                 self.indent -= 3
                 self.emit("end do")
                 return
@@ -1893,9 +1939,9 @@ class Emitter:
             self._emit_for_init(st.init)
             self.emit(f"do while ({self.cond_expr(st.cond)})")
             self.indent += 3
-            self.emit_stmt(st.stmt)
+            self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
             if st.next is not None:
-                self.emit_stmt(st.next)
+                self.emit_stmt(st.next, ret_name=ret_name, array_result_name=array_result_name)
             self.indent -= 3
             self.emit("end do")
             return
@@ -1967,7 +2013,7 @@ class Emitter:
         else:
             self.emit(f"do {var} = {lb}, {ub}, {step}")
         self.indent += 3
-        self.emit_stmt(st.stmt)
+        self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
         self.indent -= 3
         self.emit("end do")
 
@@ -2086,6 +2132,16 @@ class Emitter:
         if isinstance(node, c_ast.StructRef) and isinstance(node.field, c_ast.ID):
             fname = node.field.name.lower()
             return any(fname in flds for flds in _STRUCT_PTR_FIELDS.values())
+        return False
+
+    def _is_alloc_entity(self, node: c_ast.Node) -> bool:
+        """True when an expression denotes a lowered allocatable entity."""
+        if isinstance(node, c_ast.ID):
+            info = self.var_infos.get(node.name.lower())
+            return info is not None and info.alloc
+        if isinstance(node, c_ast.StructRef) and isinstance(node.field, c_ast.ID):
+            fname = node.field.name.lower()
+            return any(fname in fields for fields in _STRUCT_ALLOC_FIELDS.values())
         return False
 
     def _mask_unsigned(self, lhs: str, rhs: str) -> str:
@@ -2384,7 +2440,7 @@ class Emitter:
             r_is_null = isinstance(st.cond.right, c_ast.ID) and st.cond.right.name == "NULL"
             if l_is_null or r_is_null:
                 other = st.cond.right if l_is_null else st.cond.left
-                if not self._is_ptr_entity(other):
+                if not self._is_ptr_entity(other) and not self._is_alloc_entity(other):
                     return
         if self._is_pointer_nullish_cond(st.cond):
             return
@@ -2640,7 +2696,7 @@ class Emitter:
             self.emit_switch(st, ret_name=ret_name, array_result_name=array_result_name)
             return
         if isinstance(st, c_ast.For):
-            self.emit_for(st)
+            self.emit_for(st, ret_name=ret_name, array_result_name=array_result_name)
             return
         if isinstance(st, c_ast.While):
             # while (fscanf(fp, "...", &v) == 1) { ... } -> read loop with iostat
@@ -2773,8 +2829,18 @@ class Emitter:
                 return
             if isinstance(st.name, c_ast.ID) and st.name.name == "fprintf":
                 args = st.args.exprs if st.args is not None else []
-                if len(args) >= 3:
-                    self.emit(f"write({self.expr(args[0])},*) {self.expr(args[2])}")
+                if len(args) >= 2:
+                    unit = self.expr(args[0])
+                    if isinstance(args[1], c_ast.Constant) and args[1].type == "string":
+                        lines = self._translate_printf(args[1].value, list(args[2:]), unit=unit)
+                        if lines is not None:
+                            for line in lines:
+                                self.emit(line)
+                            return
+                    if len(args) >= 3:
+                        self.emit(f"write({unit},*) {', '.join(self.expr(a) for a in args[2:])}")
+                    else:
+                        self.emit(f"write({unit},*)")
                     return
             if isinstance(st.name, c_ast.ID) and st.name.name == "free":
                 args = st.args.exprs if st.args is not None else []
@@ -3230,7 +3296,7 @@ def emit_function(
                 intent = "intent(inout)"
             else:
                 intent = "intent(in)"
-        is_array_dummy = has_array_ref_of(fn.body, p.name)
+        is_array_dummy = idx in em.array_param_funcs.get(name, set())
         # A non-const pointer to a struct is conventionally mutated by the
         # callee (its members are updated in place, often via address-of-member
         # passed to a helper). Usage scanning cannot see those indirect writes,
@@ -3566,6 +3632,25 @@ def transpile_c_to_fortran(
         }
         if idxs:
             em.array_param_funcs[ext.decl.name] = idxs
+
+    # Propagate array rank through forwarding wrappers. A parameter may never
+    # be indexed in its own function but still be passed to another function's
+    # array dummy (for example weight -> categorical_random(weight)).
+    changed = True
+    while changed:
+        changed = False
+        for ext in ast.ext:
+            if not isinstance(ext, c_ast.FuncDef) or not isinstance(ext.decl.type, c_ast.FuncDecl):
+                continue
+            fdecl = ext.decl.type
+            fparams = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)] if fdecl.args else []
+            idxs = em.array_param_funcs.setdefault(ext.decl.name, set())
+            for idx, p in enumerate(fparams):
+                if idx in idxs or not p.name or not type_is_ptr_or_array(p.type):
+                    continue
+                if is_forwarded_to_array_parameter(ext.body, p.name, em.array_param_funcs):
+                    idxs.add(idx)
+                    changed = True
 
     funcs = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name != "main"]
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
@@ -4014,7 +4099,7 @@ def _requested_actions_succeeded(
         return fortran_run_ok
     if args.compile_both or args.compile_both_c:
         return original_build_ok and fortran_build_ok
-    if args.compile_c:
+    if args.compile or args.compile_c:
         return fortran_build_ok
     return True
 
@@ -4835,6 +4920,7 @@ def main() -> int:
     ap.add_argument("--inline-temp", action="store_true", help="Post-process generated Fortran with xno_variable.py")
     ap.add_argument("--run", action="store_true", help="Build and run generated Fortran output")
     ap.add_argument("--run-both", action="store_true", help="Build/run original C source and generated Fortran output")
+    ap.add_argument("--compile", action="store_true", help="Build generated Fortran output only (no C build or run)")
     ap.add_argument("--compile-c", action="store_true", help="Compile generated Fortran with -c only (no link/run)")
     ap.add_argument("--compile-both", action="store_true", help="Build original C source and generated Fortran output (no run)")
     ap.add_argument("--compile-both-c", action="store_true", help="Compile original C and generated Fortran with -c only (no link/run)")
@@ -4842,6 +4928,22 @@ def main() -> int:
     ap.add_argument("--time-both", action="store_true", help="With --run-both, time both executables and report speed ratio")
     ap.add_argument("--maxfail", type=int, default=None, help="Stop after N cases where C builds but generated Fortran does not")
     args = ap.parse_args()
+    if args.run_diff or args.time_both:
+        args.run_both = True
+    action_flags = [
+        args.run,
+        args.run_both,
+        args.compile,
+        args.compile_c,
+        args.compile_both,
+        args.compile_both_c,
+    ]
+    if sum(bool(flag) for flag in action_flags) > 1:
+        print(
+            "Use only one of --run, --run-both, --compile, --compile-c, "
+            "--compile-both, or --compile-both-c."
+        )
+        return 2
     if args.out is not None and args.out_dir is not None:
         print("Use only one of --out or --out-dir.")
         return 2
@@ -4873,8 +4975,6 @@ def main() -> int:
         args.tee = True
     if args.elemental:
         args.pure = True
-    if args.run_diff or args.time_both:
-        args.run_both = True
     if args.run_both:
         args.run = True
 
@@ -4976,7 +5076,7 @@ def main() -> int:
             f_obj = out_path.with_suffix(".o")
             cmd_f = ["gfortran", "-c", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_obj)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
-        elif args.compile_both:
+        elif args.compile or args.compile_both:
             cmd_f = ["gfortran", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_exe)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
         if args.maxfail is not None and orig_build_ok and not new_build_ok:
@@ -5074,7 +5174,7 @@ def main() -> int:
             f_obj = out_path.with_suffix(".o")
             cmd_f = ["gfortran", "-c", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_obj)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
-        elif args.compile_both:
+        elif args.compile or args.compile_both:
             cmd_f = ["gfortran", str(out_path), *DEFAULT_GFORTRAN_FLAGS, "-o", str(f_exe)]
             new_build_ok = _build_only_cmd(cmd_f, label="transformed-fortran")
         if args.maxfail is not None and orig_build_ok and not new_build_ok:
