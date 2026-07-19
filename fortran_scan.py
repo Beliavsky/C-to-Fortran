@@ -5237,6 +5237,13 @@ def inline_temp_assign_into_immediate_use(
         unit_ranges.append((s, len(out) - 1))
 
     for us, ue in unit_ranges:
+        # Never inline TARGET/POINTER entities: their identity matters for
+        # pointer association.
+        protected: Set[str] = set()
+        for k in range(us, ue + 1):
+            dcode = strip_comment(out[k]).strip()
+            if "::" in dcode and re.search(r"\btarget\b|\bpointer\b", dcode.split("::", 1)[0], re.IGNORECASE):
+                protected.update(parse_declared_names_from_decl(dcode))
         removed_vars: Set[str] = set()
         i = us
         while i <= ue:
@@ -5248,7 +5255,7 @@ def inline_temp_assign_into_immediate_use(
                 continue
             var = m.group(1).lower()
             rhs = m.group(2).strip()
-            if ";" in stmt or "&" in stmt:
+            if ";" in stmt or "&" in stmt or var in protected:
                 i += 1
                 continue
             if any(tok.group(0).lower() == var for tok in ident_re.finditer(rhs)):

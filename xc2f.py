@@ -104,6 +104,15 @@ class VarInfo:
     # entities: scalar strings use substring indexing, arrays of strings use
     # ordinary element indexing.
     char_string: bool = False
+    # True for C unsigned 32-bit integers: stored as integer(int64) and every
+    # assignment is masked to reproduce C wraparound semantics.
+    unsigned: bool = False
+    # True for arrays of C function pointers, lowered to an array of a
+    # procedure-pointer wrapper type.
+    funcptr_array: bool = False
+    # True for pointers to recursive structs (linked lists, trees): lowered to
+    # Fortran POINTER scalars with => assignment and associated() tests.
+    struct_ptr: bool = False
 
 
 @dataclass
@@ -119,12 +128,17 @@ _STRUCT_TYPEDEFS: Set[str] = set()
 # Struct name -> flexible-array-member field name (C `double data[];`).
 _STRUCT_FLEX_MEMBERS: Dict[str, str] = {}
 
+# Structs containing self-referential pointer members (linked lists, trees).
+_STRUCT_RECURSIVE: Set[str] = set()
+# Struct name -> its pointer-component field names.
+_STRUCT_PTR_FIELDS: Dict[str, Set[str]] = {}
+
 # Common <limits.h>/<stdint.h> constants lowered to literal values.
 _C_LIMIT_CONSTANTS: Dict[str, str] = {
     "INT_MAX": "2147483647",
     "INT_MIN": "(-2147483647 - 1)",
-    "UINT_MAX": "4294967295",
-    "LONG_MAX": "9223372036854775807",
+    "UINT_MAX": "4294967295_int64",
+    "LONG_MAX": "9223372036854775807_int64",
     "SHRT_MAX": "32767",
     "SHRT_MIN": "(-32768)",
     "USHRT_MAX": "65535",
@@ -526,6 +540,25 @@ def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
             return
         ftype, alloc = c_to_ftype(node.type)
         if node.name:
+            # `int (*ops[3])(int, int)`: array of function pointers becomes an
+            # array of the procedure-pointer wrapper type.
+            if (
+                isinstance(node.type, c_ast.ArrayDecl)
+                and isinstance(node.type.type, c_ast.PtrDecl)
+                and isinstance(node.type.type.type, c_ast.FuncDecl)
+            ):
+                n_txt = _render_dim_expr(node.type.dim) if node.type.dim is not None else None
+                if n_txt is None and isinstance(node.init, c_ast.InitList):
+                    n_txt = str(len(node.init.exprs or []))
+                if n_txt is not None:
+                    out[node.name] = VarInfo(
+                        ftype="type(c2f_procptr)",
+                        shape=(n_txt,),
+                        funcptr_array=True,
+                    )
+                    for _, child in node.children():
+                        gather_decls(child, out)
+                    return
             char_kind = _classify_char_decl(node.type)
             if char_kind == "scalar":
                 buf_len = _char_array_decl_len(node.type)
@@ -587,10 +620,31 @@ def gather_decls(node: c_ast.Node, out: Dict[str, VarInfo]) -> None:
             mflex = re.match(r"^type\(([^)]+)\)$", ftype, re.IGNORECASE)
             if alloc and mflex is not None and mflex.group(1).lower() in _STRUCT_FLEX_MEMBERS:
                 alloc = False
+            # A pointer to a recursive struct (list/tree node) becomes a true
+            # Fortran POINTER scalar.
+            is_struct_ptr = False
+            if alloc and mflex is not None and mflex.group(1).lower() in _STRUCT_RECURSIVE:
+                alloc = False
+                is_struct_ptr = True
+            # C unsigned int: widen to int64 and mask assignments so C's
+            # modulo-2^32 wraparound is reproduced.
+            is_unsigned = False
+            if ftype == "integer" and not alloc and not dims:
+                tnode = node.type
+                while isinstance(tnode, (c_ast.ArrayDecl, c_ast.PtrDecl, c_ast.TypeDecl)) and not isinstance(tnode, c_ast.PtrDecl):
+                    if isinstance(tnode, c_ast.TypeDecl):
+                        tnode = tnode.type
+                        break
+                    tnode = tnode.type
+                if isinstance(tnode, c_ast.IdentifierType) and "unsigned" in [x.lower() for x in tnode.names]:
+                    ftype = "integer(kind=int64)"
+                    is_unsigned = True
             out[node.name] = VarInfo(
                 ftype=ftype,
                 alloc=alloc,
                 shape=tuple(reversed(dims)) if dims else None,
+                unsigned=is_unsigned,
+                struct_ptr=is_struct_ptr,
             )
     for _, child in node.children():
         gather_decls(child, out)
@@ -605,6 +659,8 @@ def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
     """
     out: Dict[str, StructDef] = {}
     _STRUCT_FLEX_MEMBERS.clear()
+    _STRUCT_RECURSIVE.clear()
+    _STRUCT_PTR_FIELDS.clear()
     for ext in ast.ext:
         name: Optional[str] = None
         struct: Optional[c_ast.Node] = None
@@ -628,6 +684,16 @@ def collect_struct_typedefs(ast: c_ast.FileAST) -> Dict[str, StructDef]:
                 fields.append((d.name, ftype, ":"))
                 _STRUCT_FLEX_MEMBERS[name.lower()] = d.name
                 continue
+            if isinstance(d.type, c_ast.PtrDecl):
+                base = d.type.type
+                while isinstance(base, c_ast.TypeDecl):
+                    base = base.type
+                if isinstance(base, (c_ast.Struct, c_ast.Union)) and (base.name or "").lower() == name.lower():
+                    # Self-referential pointer member (list/tree link).
+                    fields.append((d.name, f"type({name.lower()})", "*"))
+                    _STRUCT_RECURSIVE.add(name.lower())
+                    _STRUCT_PTR_FIELDS.setdefault(name.lower(), set()).add(d.name.lower())
+                    continue
             dims: List[str] = []
             type_node = d.type
             while isinstance(type_node, c_ast.ArrayDecl):
@@ -838,6 +904,83 @@ def collect_generic_macros(text: str) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def _has_void_ptr_param(fn: c_ast.FuncDef) -> bool:
+    """True when the C function takes any `void *` parameter."""
+    fdecl = fn.decl.type
+    if not isinstance(fdecl, c_ast.FuncDecl) or fdecl.args is None:
+        return False
+    for p in fdecl.args.params:
+        if not isinstance(p, c_ast.Decl):
+            continue
+        node = p.type
+        depth = 0
+        while isinstance(node, (c_ast.PtrDecl, c_ast.TypeDecl)):
+            if isinstance(node, c_ast.PtrDecl):
+                depth += 1
+            node = node.type
+        if depth >= 1 and isinstance(node, c_ast.IdentifierType) and "void" in [x.lower() for x in node.names]:
+            return True
+    return False
+
+
+def _collect_qsort_elem_kinds(ast_root: c_ast.FileAST) -> Set[str]:
+    """Element kinds ("int"/"real") sorted via qsort() anywhere in the file."""
+    kinds: Set[str] = set()
+    for e in ast_root.ext:
+        if not isinstance(e, c_ast.FuncDef):
+            continue
+        lm: Dict[str, VarInfo] = {}
+        gather_decls(e.body, lm)
+
+        def visit(node: c_ast.Node) -> None:
+            if (
+                isinstance(node, c_ast.FuncCall)
+                and isinstance(node.name, c_ast.ID)
+                and node.name.name == "qsort"
+                and node.args is not None
+                and node.args.exprs
+                and isinstance(node.args.exprs[0], c_ast.ID)
+            ):
+                info = lm.get(node.args.exprs[0].name)
+                ft = (info.ftype if info is not None else "integer").lower()
+                kinds.add("real" if ft.startswith("real") else "int")
+            for _k, child in node.children():
+                if isinstance(child, c_ast.Node):
+                    visit(child)
+
+        visit(e.body)
+    return kinds
+
+
+def emit_qsort_helper(em: Emitter, kind: str) -> None:
+    """Emit an ascending in-place insertion sort standing in for C qsort."""
+    tname = "integer" if kind == "int" else "real(kind=dp)"
+    em.emit(f"subroutine c2f_sort_{kind}(a)")
+    em.emit("! ascending sort (C qsort call; comparator assumed ascending)")
+    em.emit(f"{tname}, intent(inout) :: a(:)")
+    em.emit("integer :: i, j")
+    em.emit(f"{tname} :: key")
+    em.emit("do i = 2, size(a)")
+    em.emit("   key = a(i)")
+    em.emit("   j = i - 1")
+    em.emit("   do")
+    em.emit("      if (j < 1) exit")
+    em.emit("      if (a(j) <= key) exit")
+    em.emit("      a(j+1) = a(j)")
+    em.emit("      j = j - 1")
+    em.emit("   end do")
+    em.emit("   a(j+1) = key")
+    em.emit("end do")
+    em.emit(f"end subroutine c2f_sort_{kind}")
+
+
+def _body_has_unsigned_locals(body: c_ast.Node) -> bool:
+    """True when the body declares any C unsigned-int local."""
+    probe: Dict[str, VarInfo] = {}
+    gather_decls(body, probe)
+    return any(info.unsigned for info in probe.values())
+
+
 def _subtree_has_funccall(node: c_ast.Node) -> bool:
     """True when the expression subtree contains any function call."""
     if isinstance(node, c_ast.FuncCall):
@@ -976,6 +1119,11 @@ class Emitter:
         # C pointer aliases folded away, e.g. `tmp = realloc(x, ...)` makes
         # tmp an alias of x (lowercase key -> target name).
         self.alias_map: Dict[str, str] = {}
+        # Function-pointer arrays in the current unit: lowercase name -> the
+        # module function providing the procedure interface.
+        self.funcptr_arrays: Dict[str, str] = {}
+        # Locals/dummies that are Fortran POINTERs to recursive-struct nodes.
+        self.struct_ptr_names: Set[str] = set()
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
@@ -1235,6 +1383,14 @@ class Emitter:
             if op == "&":
                 return self.expr(n.expr)
             if op == "*":
+                # Explicit dereference of pointer arithmetic reads a single
+                # element: *(p + i) -> p((i)+1).
+                inner = n.expr
+                if isinstance(inner, c_ast.BinaryOp) and inner.op == "+":
+                    if self._is_pointer_like_id(inner.left):
+                        return f"{self.expr(inner.left)}(({self.expr(inner.right)})+1)"
+                    if self._is_pointer_like_id(inner.right):
+                        return f"{self.expr(inner.right)}(({self.expr(inner.left)})+1)"
                 return self.expr(n.expr)
             if op == "p++" or op == "p--":
                 return self.expr(n.expr)
@@ -1256,6 +1412,13 @@ class Emitter:
                 nul_cmp = self._nul_terminator_compare(n)
                 if nul_cmp is not None:
                     return nul_cmp
+                # NULL tests on POINTER entities become association tests.
+                for side, other in ((n.left, n.right), (n.right, n.left)):
+                    if isinstance(other, c_ast.ID) and other.name == "NULL" and self._is_ptr_entity(side):
+                        base = self.expr(side)
+                        if op == "==":
+                            return f"(.not. associated({base}))"
+                        return f"associated({base})"
             # C pointer arithmetic used as "tail pointer" argument: a + k
             if op == "+":
                 if self._is_pointer_like_id(n.left):
@@ -1353,6 +1516,15 @@ class Emitter:
                 return f"{name}({self.expr(idx.expr)}+1)"
             return f"{name}({self.expr(idx)}+1)"
         if isinstance(n, c_ast.FuncCall):
+            # ops[i](args): call through a function-pointer array element.
+            if (
+                isinstance(n.name, c_ast.ArrayRef)
+                and isinstance(n.name.name, c_ast.ID)
+                and n.name.name.name.lower() in self.funcptr_arrays
+            ):
+                base = self.expr(n.name)
+                args = [self.expr(a) for a in (n.args.exprs if n.args is not None else [])]
+                return f"{base}%fp({', '.join(args)})"
             fname = self.expr(n.name)
             # `&arr[i]` (array decay) passed where the callee expects an array
             # becomes an array section `arr(i+1:)` rather than a scalar element.
@@ -1605,6 +1777,15 @@ class Emitter:
             else:
                 self.emit(f"{info.ftype} :: {name}")
             return
+        if info.struct_ptr:
+            self.emit(f"{info.ftype}, pointer :: {name}")
+            return
+        # A by-value local of a recursive struct type may have its address
+        # linked into other nodes: give it the TARGET attribute.
+        mrec = re.match(r"^type\(([^)]+)\)$", info.ftype, re.IGNORECASE)
+        if mrec is not None and mrec.group(1).lower() in _STRUCT_RECURSIVE and not info.shape and not info.alloc:
+            self.emit(f"{info.ftype}, target :: {name}")
+            return
         if info.alloc:
             self.emit(f"{info.ftype}, allocatable :: {name}(:)")
             self.arrays_1d.add(name)
@@ -1849,9 +2030,15 @@ class Emitter:
             return ".false."
         return "0"
 
-    def _component_value(self, node: c_ast.Node, ftype: str) -> str:
+    def _component_value(self, node: c_ast.Node, ftype: str, shape: Optional[str] = None) -> str:
         """Lower one struct-component initializer, recursing into nested structs
         and array-valued components."""
+        if shape == "*":
+            # Pointer component: NULL -> null(), &var -> the TARGET variable.
+            if isinstance(node, c_ast.ID) and node.name == "NULL":
+                return "null()"
+            if isinstance(node, c_ast.UnaryOp) and node.op == "&":
+                return self.expr(node.expr)
         m = re.match(r"^type\(([^)]+)\)$", ftype, re.IGNORECASE)
         if m is not None and isinstance(node, c_ast.InitList) and m.group(1).lower() in self.struct_defs:
             return self._struct_constructor(m.group(1), node)
@@ -1875,21 +2062,38 @@ class Emitter:
             return f"{type_name}({values})"
         if any(isinstance(e, c_ast.NamedInitializer) for e in exprs):
             field_vals: Dict[str, str] = {}
-            ftype_by_name = {fn.lower(): ft for fn, ft, _ in sdef.fields}
+            spec_by_name = {fn.lower(): (ft, sh) for fn, ft, sh in sdef.fields}
             for e in exprs:
                 if isinstance(e, c_ast.NamedInitializer) and e.name and isinstance(e.name[0], c_ast.ID):
                     fn = e.name[0].name.lower()
-                    field_vals[fn] = self._component_value(e.expr, ftype_by_name.get(fn, "integer"))
+                    ft, sh = spec_by_name.get(fn, ("integer", None))
+                    field_vals[fn] = self._component_value(e.expr, ft, sh)
             ordered = [
-                field_vals.get(fname.lower(), self._zero_literal(ftype))
-                for fname, ftype, _shape in sdef.fields
+                field_vals.get(fname.lower(), "null()" if shape == "*" else self._zero_literal(ftype))
+                for fname, ftype, shape in sdef.fields
             ]
         else:
             ordered = [
-                self._component_value(v, ftype)
-                for (fname, ftype, _shape), v in zip(sdef.fields, exprs)
+                self._component_value(v, ftype, shape)
+                for (fname, ftype, shape), v in zip(sdef.fields, exprs)
             ]
         return f"{type_name}({', '.join(ordered)})"
+
+    def _is_ptr_entity(self, node: c_ast.Node) -> bool:
+        """True when the expression denotes a Fortran POINTER entity."""
+        if isinstance(node, c_ast.ID):
+            return node.name.lower() in self.struct_ptr_names
+        if isinstance(node, c_ast.StructRef) and isinstance(node.field, c_ast.ID):
+            fname = node.field.name.lower()
+            return any(fname in flds for flds in _STRUCT_PTR_FIELDS.values())
+        return False
+
+    def _mask_unsigned(self, lhs: str, rhs: str) -> str:
+        """Mask assignments to unsigned 32-bit targets to C wraparound."""
+        vinfo = self.var_infos.get(lhs.lower())
+        if vinfo is not None and vinfo.unsigned:
+            return f"iand({rhs}, 4294967295_int64)"
+        return rhs
 
     def _emit_realloc_grow(self, lhs: str, fc: c_ast.FuncCall) -> None:
         """Emit allocatable growth (move_alloc) for a C realloc of `lhs`."""
@@ -1940,7 +2144,7 @@ class Emitter:
             bop = op_map.get(st.op)
             if bop is None:
                 raise NotImplementedError(f"Unsupported assignment op {st.op}")
-            self.emit(f"{lhs} = {lhs} {bop} {rhs}")
+            self.emit(f"{lhs} = {self._mask_unsigned(lhs, f'{lhs} {bop} {rhs}')}")
             return
 
         # Chained assignment: `a = b = c = expr;` -> emit inner chain first,
@@ -2025,7 +2229,8 @@ class Emitter:
             self.emit(f"call random_number({self.expr(st.lvalue)})")
             return
 
-        self.emit(f"{self.expr(st.lvalue)} = {self.simp(self.expr(st.rvalue))}")
+        lhs_txt = self.expr(st.lvalue)
+        self.emit(f"{lhs_txt} = {self._mask_unsigned(lhs_txt, self.simp(self.expr(st.rvalue)))}")
 
     def _unwrap_single_stmt(self, node: Optional[c_ast.Node]) -> Optional[c_ast.Node]:
         if node is None:
@@ -2171,12 +2376,16 @@ class Emitter:
             self.indent -= 3
             self.emit("end block")
             return
-        # suppress C pointer/null checks that are not needed after signature lowering
+        # suppress C pointer/null checks that are not needed after signature
+        # lowering — except for true POINTER entities, whose NULL tests become
+        # meaningful associated() checks.
         if isinstance(st.cond, c_ast.BinaryOp) and st.cond.op in ("==", "!="):
             l_is_null = isinstance(st.cond.left, c_ast.ID) and st.cond.left.name == "NULL"
             r_is_null = isinstance(st.cond.right, c_ast.ID) and st.cond.right.name == "NULL"
             if l_is_null or r_is_null:
-                return
+                other = st.cond.right if l_is_null else st.cond.left
+                if not self._is_ptr_entity(other):
+                    return
         if self._is_pointer_nullish_cond(st.cond):
             return
         if self._emit_if_as_merge_update(st):
@@ -2266,6 +2475,23 @@ class Emitter:
             # declarations already hoisted
             if st.init is not None:
                 info = self.var_infos.get((st.name or "").lower())
+                if info is not None and info.struct_ptr:
+                    init = st.init.expr if isinstance(st.init, c_ast.Cast) else st.init
+                    if isinstance(init, c_ast.ID) and init.name == "NULL":
+                        self.emit(f"{st.name} => null()")
+                        return
+                    if isinstance(init, c_ast.FuncCall) and isinstance(init.name, c_ast.ID) and init.name.name == "malloc":
+                        self.emit(f"allocate({st.name})")
+                        return
+                    self.emit(f"{st.name} => {self.expr(init)}")
+                    return
+                if isinstance(st.init, c_ast.InitList) and info is not None and info.funcptr_array:
+                    # Function-pointer array: point each element's procedure
+                    # pointer at the named module function.
+                    for k, e in enumerate(st.init.exprs or [], start=1):
+                        if isinstance(e, c_ast.ID):
+                            self.emit(f"{st.name}({k})%fp => {e.name}")
+                    return
                 if isinstance(st.init, c_ast.InitList) and info is not None and info.shape and info.char_string:
                     # Array of C strings: a typed constructor pads shorter
                     # literals to the common declared length.
@@ -2363,6 +2589,19 @@ class Emitter:
                 self.emit(f"{st.name} = {self.expr(st.init)}")
             return
         if isinstance(st, c_ast.Assignment):
+            # POINTER-entity targets use pointer assignment / allocation.
+            if st.op == "=" and self._is_ptr_entity(st.lvalue):
+                lhs = self.expr(st.lvalue)
+                rv = st.rvalue.expr if isinstance(st.rvalue, c_ast.Cast) else st.rvalue
+                if isinstance(rv, c_ast.ID) and rv.name == "NULL":
+                    self.emit(f"{lhs} => null()")
+                    return
+                if isinstance(rv, c_ast.FuncCall) and isinstance(rv.name, c_ast.ID) and rv.name.name == "malloc":
+                    self.emit(f"allocate({lhs})")
+                    return
+                if self._is_ptr_entity(rv) or (isinstance(rv, c_ast.UnaryOp) and rv.op == "&"):
+                    self.emit(f"{lhs} => {self.expr(rv)}")
+                    return
             # suppress *out = NULL
             if isinstance(st.lvalue, c_ast.UnaryOp) and st.lvalue.op == "*" and isinstance(st.rvalue, c_ast.ID) and st.rvalue.name == "NULL":
                 return
@@ -2467,6 +2706,16 @@ class Emitter:
                 else:
                     self.emit("write(*,*)")
                 return
+            if isinstance(st.name, c_ast.ID) and st.name.name == "qsort":
+                # qsort(arr, n, size, cmp) -> generated ascending sort helper.
+                args = st.args.exprs if st.args is not None else []
+                if len(args) >= 2:
+                    arr = self.expr(args[0])
+                    n = self.expr(args[1])
+                    ainfo = self.var_infos.get(arr.lower())
+                    kind = "real" if (ainfo is not None and ainfo.ftype.lower().startswith("real")) else "int"
+                    self.emit(f"call c2f_sort_{kind}({arr}(1:{n}))")
+                    return
             if isinstance(st.name, c_ast.ID) and st.name.name in ("memset", "memcpy", "memmove"):
                 # memset(dst, v, n) fills with v; memcpy(dst, src, n) copies.
                 # Either way the second argument is the whole-array RHS here.
@@ -2532,6 +2781,9 @@ class Emitter:
                 if len(args) == 1:
                     v = self.expr(args[0])
                     if v.lower() in self.auto_alloc_assigned:
+                        return
+                    if v.lower() in self.struct_ptr_names:
+                        self.emit(f"deallocate({v})")
                         return
                     flex = self._flex_member_for(v)
                     if flex is not None:
@@ -2599,6 +2851,91 @@ def emit_rand_helper(em: Emitter) -> None:
     em.emit("call random_number(rand_r)")
     em.emit("rand_result = int(rand_r * 2147483648.0_dp)")
     em.emit("end function rand")
+
+
+def _register_funcptr_arrays(em: Emitter, body: c_ast.Node, locals_map: Dict[str, VarInfo]) -> None:
+    """Record function-pointer array locals and their interface function."""
+    names = {n.lower() for n, info in locals_map.items() if info.funcptr_array}
+    if not names:
+        return
+
+    def visit(node: c_ast.Node) -> None:
+        if (
+            isinstance(node, c_ast.Decl)
+            and node.name
+            and node.name.lower() in names
+            and isinstance(node.init, c_ast.InitList)
+        ):
+            for e in node.init.exprs or []:
+                if isinstance(e, c_ast.ID):
+                    em.funcptr_arrays[node.name.lower()] = e.name
+                    break
+        for _k, child in node.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(body)
+
+
+def emit_funcptr_wrapper_type(em: Emitter) -> None:
+    """Emit the wrapper type holding one procedure pointer per element."""
+    iface = next(iter(em.funcptr_arrays.values()))
+    em.emit("type :: c2f_procptr")
+    em.emit(f"   procedure({iface}), pointer, nopass :: fp")
+    em.emit("end type c2f_procptr")
+
+
+def _demote_nonarray_pointer_locals(em: Emitter, body: c_ast.Node, locals_map: Dict[str, VarInfo]) -> None:
+    """Treat pointer locals never used as arrays as plain scalars.
+
+    C code like `int *p = NULL; set_value(&p, &x); printf("%d", *p);` uses the
+    pointer only for aliasing a scalar; value semantics (a plain scalar passed
+    with intent(out)) reproduces the observable behavior.
+    """
+    names = {n.lower() for n, info in locals_map.items() if info.alloc and not info.char_string}
+    if not names:
+        return
+    keep: Set[str] = set()
+
+    def visit(node: c_ast.Node) -> None:
+        if isinstance(node, c_ast.ArrayRef) and isinstance(node.name, c_ast.ID):
+            keep.add(node.name.name.lower())
+        # Pointer arithmetic (p + i) marks p as an array view.
+        if isinstance(node, c_ast.BinaryOp) and node.op in ("+", "-"):
+            for side in (node.left, node.right):
+                if isinstance(side, c_ast.ID):
+                    keep.add(side.name.lower())
+        # Aliasing an array (`p = x` / `int *p = x`) keeps array semantics.
+        if isinstance(node, c_ast.Assignment) and isinstance(node.lvalue, c_ast.ID) and isinstance(node.rvalue, c_ast.ID) and node.rvalue.name != "NULL":
+            keep.add(node.lvalue.name.lower())
+        if isinstance(node, c_ast.Decl) and node.name and isinstance(node.init, c_ast.ID) and node.init.name != "NULL":
+            keep.add(node.name.lower())
+        if isinstance(node, c_ast.FuncCall) and isinstance(node.name, c_ast.ID) and node.args is not None:
+            fname = node.name.name
+            if fname in ("malloc", "calloc", "realloc", "free"):
+                for a in node.args.exprs:
+                    if isinstance(a, c_ast.ID):
+                        keep.add(a.name.lower())
+            arr_idxs = em.array_param_funcs.get(fname, set())
+            for idx, a in enumerate(node.args.exprs):
+                if idx in arr_idxs:
+                    if isinstance(a, c_ast.ID):
+                        keep.add(a.name.lower())
+                    elif isinstance(a, c_ast.UnaryOp) and isinstance(a.expr, c_ast.ID):
+                        keep.add(a.expr.name.lower())
+        # A malloc-family call in a declaration initializer also keeps it.
+        if isinstance(node, c_ast.Decl) and node.name and node.init is not None:
+            init = node.init.expr if isinstance(node.init, c_ast.Cast) else node.init
+            if isinstance(init, c_ast.FuncCall) and isinstance(init.name, c_ast.ID) and init.name.name in ("malloc", "calloc", "realloc"):
+                keep.add(node.name.lower())
+        for _k, child in node.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(body)
+    for n, info in locals_map.items():
+        if n.lower() in names and n.lower() not in keep:
+            info.alloc = False
 
 
 def _register_realloc_aliases(em: Emitter, body: c_ast.Node, locals_map: Dict[str, VarInfo]) -> None:
@@ -2698,11 +3035,15 @@ def emit_function(
     need_ieee_consts = ast_uses_any_id(fn.body, {"NAN", "INFINITY", "HUGE_VAL"})
     is_recursive = name in collect_called_names(fn.body, {name})
 
+    need_int64 = ast_uses_any_id(fn.body, {"UINT_MAX", "LONG_MAX"}) or _body_has_unsigned_locals(fn.body)
+
     if name == "main":
         em.emit("program main")
         if main_use_names:
             em.emit(f"use xc2f_mod, only: {', '.join(main_use_names)}")
         em.emit("use, intrinsic :: iso_fortran_env, only: real64")
+        if need_int64:
+            em.emit("use, intrinsic :: iso_fortran_env, only: int64")
         if need_ieee_consts:
             em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
         em.emit("implicit none")
@@ -2712,6 +3053,8 @@ def emit_function(
         locals_map: Dict[str, VarInfo] = {}
         gather_decls(fn.body, locals_map)
         _register_realloc_aliases(em, fn.body, locals_map)
+        _demote_nonarray_pointer_locals(em, fn.body, locals_map)
+        _register_funcptr_arrays(em, fn.body, locals_map)
         # C main(argc, argv): argc maps onto command_argument_count()+1 (the
         # command name is argument 0 in both models) and argv[i] onto the
         # argv_value() helper.
@@ -2728,6 +3071,9 @@ def emit_function(
         emit_used_defines(em, fn.body, taken=set(locals_map.keys()))
         em.var_infos = {k.lower(): v for k, v in locals_map.items()}
         for n, info in locals_map.items():
+            if info.struct_ptr:
+                em.struct_ptr_names.add(n.lower())
+                continue
             if info.char_string:
                 if not info.shape:
                     em.char_string_names.add(n.lower())
@@ -2735,6 +3081,8 @@ def emit_function(
             if info.alloc:
                 em.pointer_like_names.add(n.lower())
         em.indent = 0
+        if em.funcptr_arrays:
+            emit_funcptr_wrapper_type(em)
         em.emit_decl_grouped(locals_map, params=set(), ret_name=None)
         if argc_assign is not None:
             em.emit(argc_assign)
@@ -2745,6 +3093,8 @@ def emit_function(
         em.id_rename = {}
         em.argv_name = None
         em.alias_map = {}
+        em.funcptr_arrays = {}
+        em.struct_ptr_names.clear()
         em.var_infos = {}
         return
 
@@ -2833,6 +3183,8 @@ def emit_function(
     else:
         param_comment_map = {}
     em.emit("use, intrinsic :: iso_fortran_env, only: real64")
+    if need_int64:
+        em.emit("use, intrinsic :: iso_fortran_env, only: int64")
     if need_ieee_consts:
         em.emit("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf")
     for enum_name, enum_value in em.enum_constants.items():
@@ -2854,6 +3206,15 @@ def emit_function(
                 # C function-pointer parameter: a dummy procedure with the
                 # interface of a function actually passed at some call site.
                 em.emit(f"procedure({iface}) :: {p.name}")
+                continue
+        if isinstance(p.type, c_ast.PtrDecl):
+            pf_ptr, _ = c_to_ftype(p.type)
+            mrec_p = re.match(r"^type\(([^)]+)\)$", pf_ptr, re.IGNORECASE)
+            if mrec_p is not None and mrec_p.group(1).lower() in _STRUCT_RECURSIVE:
+                # Pointer to a recursive struct: a POINTER dummy. intent(in)
+                # lets a TARGET actual associate the pointer on entry (F2008).
+                em.emit(f"{pf_ptr}, pointer, intent(in) :: {p.name}")
+                em.struct_ptr_names.add(p.name.lower())
                 continue
         p_ft, p_alloc = c_to_ftype(p.type)
         p_ptr_or_arr = type_is_ptr_or_array(p.type)
@@ -2907,8 +3268,13 @@ def emit_function(
     locals_map: Dict[str, VarInfo] = {}
     gather_decls(fn.body, locals_map)
     _register_realloc_aliases(em, fn.body, locals_map)
+    _demote_nonarray_pointer_locals(em, fn.body, locals_map)
+    _register_funcptr_arrays(em, fn.body, locals_map)
     em.var_infos = {k.lower(): v for k, v in locals_map.items()}
     for n, info in locals_map.items():
+        if info.struct_ptr:
+            em.struct_ptr_names.add(n.lower())
+            continue
         if info.char_string:
             if not info.shape:
                 em.char_string_names.add(n.lower())
@@ -2931,6 +3297,8 @@ def emit_function(
                             em.array_result_tmp_alias = tmp
                             del locals_map[tmp]
                             break
+    if em.funcptr_arrays:
+        emit_funcptr_wrapper_type(em)
     em.emit_decl_grouped(locals_map, params=param_set, ret_name=result_name_for_body if unit_kind == "function" else None)
 
     # body
@@ -2949,6 +3317,8 @@ def emit_function(
     em.char_string_names.clear()
     em.id_rename = {}
     em.alias_map = {}
+    em.funcptr_arrays = {}
+    em.struct_ptr_names.clear()
     em.var_infos = {}
 
 
@@ -3199,6 +3569,11 @@ def transpile_c_to_fortran(
 
     funcs = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name != "main"]
     mains = [e for e in ast.ext if isinstance(e, c_ast.FuncDef) and e.decl.name == "main"]
+    # qsort comparators take const void* arguments, which have no value-level
+    # translation; qsort calls become a generated sort helper and the
+    # comparator functions are dropped.
+    funcs = [e for e in funcs if not _has_void_ptr_param(e)]
+    qsort_kinds = _collect_qsort_elem_kinds(ast)
     uses_rand = bool(collect_called_names(ast, {"rand"}))
     main_uses_rand = any(collect_called_names(m, {"rand"}) for m in mains)
     uses_argv = False
@@ -3306,7 +3681,7 @@ def transpile_c_to_fortran(
 
     # Emit a module whenever there are module procedures, a rand()/argv
     # helper, struct type definitions, or shared global variables.
-    if funcs or uses_rand or uses_argv or struct_defs or global_vars:
+    if funcs or uses_rand or uses_argv or struct_defs or global_vars or qsort_kinds:
         em.emit("module xc2f_mod")
         em.emit("implicit none")
         em.emit("private")
@@ -3316,6 +3691,7 @@ def transpile_c_to_fortran(
                 publics.append("rand")
             if uses_argv:
                 publics.append("argv_value")
+            publics.extend(f"c2f_sort_{k}" for k in sorted(qsort_kinds))
         else:
             publics = sorted(module_proc_names)
         publics.extend(sorted(struct_defs.keys()))
@@ -3331,6 +3707,8 @@ def transpile_c_to_fortran(
                 for fname, ftype, shape in sdef.fields:
                     if shape == ":":
                         em.emit(f"   {ftype}, allocatable :: {fname}(:)")
+                    elif shape == "*":
+                        em.emit(f"   {ftype}, pointer :: {fname} => null()")
                     elif shape:
                         em.emit(f"   {ftype} :: {fname}({shape})")
                     else:
@@ -3347,7 +3725,7 @@ def transpile_c_to_fortran(
                     decl += f" = {ginit}"
                 em.emit(decl)
             em.emit("")
-        if funcs or uses_rand or uses_argv:
+        if funcs or uses_rand or uses_argv or qsort_kinds:
             em.emit("contains")
             em.emit("")
             for ext in funcs:
@@ -3364,6 +3742,9 @@ def transpile_c_to_fortran(
             if uses_argv:
                 emit_argv_helper(em)
                 em.emit("")
+            for k in sorted(qsort_kinds):
+                emit_qsort_helper(em, k)
+                em.emit("")
         em.emit("end module xc2f_mod")
         em.emit("")
 
@@ -3372,6 +3753,7 @@ def transpile_c_to_fortran(
         main_use_names.append("rand")
     if uses_argv:
         main_use_names.append("argv_value")
+    main_use_names.extend(f"c2f_sort_{k}" for k in sorted(qsort_kinds))
     for ext in mains:
         emit_function(
             ext,
@@ -4341,6 +4723,13 @@ def inline_single_use_temp_assignments(lines: List[str]) -> List[str]:
         unit_ranges.append((s, len(out) - 1))
 
     for us, ue in unit_ranges:
+        # Never inline TARGET/POINTER entities: their identity matters for
+        # pointer association (e.g. structure constructors linking nodes).
+        protected: Set[str] = set()
+        for k in range(us, ue + 1):
+            dcode = fscan.strip_comment(out[k]).strip()
+            if "::" in dcode and re.search(r"\btarget\b|\bpointer\b", dcode.split("::", 1)[0], re.IGNORECASE):
+                protected.update(fscan.parse_declared_names_from_decl(dcode))
         removed_vars: Set[str] = set()
         i = us
         while i <= ue:
@@ -4352,6 +4741,9 @@ def inline_single_use_temp_assignments(lines: List[str]) -> List[str]:
                 i += 1
                 continue
             var = m_as.group(1).lower()
+            if var in protected:
+                i += 1
+                continue
             rhs = m_as.group(2).strip()
             if any(tok.group(0).lower() == var for tok in ident_re.finditer(rhs)):
                 i += 1
