@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -100,6 +101,7 @@ def test_compile_both_requires_both_compilers_to_succeed() -> None:
         run=False,
         compile_both=True,
         compile_both_c=False,
+        compile=False,
         compile_c=False,
     )
 
@@ -117,6 +119,31 @@ def test_compile_both_requires_both_compilers_to_succeed() -> None:
         fortran_run_ok=False,
         fortran_build_ok=False,
     )
+
+
+def test_compile_builds_only_generated_fortran(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "hello.c"
+    output = tmp_path / "hello.f90"
+    source.write_text('int main(void) { return 0; }\n', encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def fake_build(command, *, label):
+        commands.append(command)
+        assert label == "transformed-fortran"
+        return True
+
+    monkeypatch.setattr(xc2f, "_build_only_cmd", fake_build)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["xc2f.py", str(source), "--out", str(output), "--compile"],
+    )
+
+    assert xc2f.main() == 0
+    assert len(commands) == 1
+    assert commands[0][0] == "gfortran"
+    assert "-c" not in commands[0]
+    assert commands[0][-2:] == ["-o", str(output.with_suffix(".exe"))]
 
 
 @pytest.mark.integration

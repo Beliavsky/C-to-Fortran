@@ -93,3 +93,32 @@ def test_run_both_batch_continues_after_a_failed_file(tmp_path, monkeypatch, cap
     output = capsys.readouterr().out
     assert f"[1/2] {sources[0]}" in output
     assert f"\n\n[2/2] {sources[1]}" in output
+
+
+def test_compile_forwards_fortran_only_mode(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "hello.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def fake_subprocess_run(command, **kwargs):
+        commands.append(command)
+        return completed(command)
+
+    monkeypatch.setattr(xc2f_batch, "_expand_inputs", lambda inputs: [source])
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "xc2f_batch.py",
+            "*.c",
+            "--compile",
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert xc2f_batch.main() == 0
+    assert len(commands) == 1
+    assert "--compile" in commands[0]
+    assert "--compile-both" not in commands[0]

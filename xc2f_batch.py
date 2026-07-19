@@ -253,6 +253,7 @@ def main() -> int:
     )
     ap.add_argument("--compile-both", action="store_true", help="Forward --compile-both to xc2f.py.")
     ap.add_argument("--compile-both-c", action="store_true", help="Forward --compile-both-c to xc2f.py.")
+    ap.add_argument("--compile", action="store_true", help="Compile only the emitted Fortran executable.")
     ap.add_argument("--compile-c", action="store_true", help="Forward --compile-c to xc2f.py.")
     ap.add_argument("--run-diff", action="store_true", help="Forward --run-diff to xc2f.py.")
     ap.add_argument("--time-both", action="store_true", help="Forward --time-both to xc2f.py.")
@@ -271,9 +272,12 @@ def main() -> int:
     if args.run_diff or args.time_both:
         args.run_both = True
 
-    mode_flags = [args.run_both, args.compile_both, args.compile_both_c, args.compile_c]
+    mode_flags = [args.run_both, args.compile, args.compile_both, args.compile_both_c, args.compile_c]
     if sum(1 for flag in mode_flags if flag) > 1:
-        print("Invalid options: choose at most one of --run-both, --compile-both, --compile-both-c, or --compile-c.")
+        print(
+            "Invalid options: choose at most one of --run-both, --compile, "
+            "--compile-both, --compile-both-c, or --compile-c."
+        )
         return 1
     if not any(mode_flags):
         args.compile_both = True
@@ -326,6 +330,8 @@ def main() -> int:
             transpile_flags.append("--tee-both")
         if args.run_both:
             cmd.append("--run-both")
+        elif args.compile:
+            cmd.append("--compile")
         elif args.compile_both:
             cmd.append("--compile-both")
         elif args.compile_both_c:
