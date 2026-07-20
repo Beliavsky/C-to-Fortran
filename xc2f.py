@@ -4872,6 +4872,14 @@ def transpile_c_to_fortran(
     out_text = "".join(fpost.normalize_delimiter_inner_spacing(out_text.splitlines(keepends=True)))
     out_text = "".join(fpost.simplify_bfgs_rank1_update(out_text.splitlines(keepends=True)))
     out_text = "".join(fscan.simplify_do_bounds_parens(out_text.splitlines(keepends=True)))
+    out_text = "".join(
+        fscan.simplify_integer_arithmetic_in_lines(out_text.splitlines(keepends=True))
+    )
+    out_text = "".join(
+        fpost.remove_parentheses_around_variable_references(
+            out_text.splitlines(keepends=True)
+        )
+    )
     out_text = "".join(fpost.rewrite_named_arguments(out_text.splitlines(keepends=True)))
     out_text = "".join(fpost.wrap_long_lines(out_text.splitlines(keepends=True), max_len=80))
     out_text = "".join(fpost.apply_xindent_defaults(out_text.splitlines(keepends=True), max_len=80))
@@ -6070,6 +6078,7 @@ def main() -> int:
             post_lines_loc = _remove_arg_style_doc_comments(post_lines_loc)
             fsrc_loc = _normalize_kind_intrinsic_literals("".join(post_lines_loc))
         final_lines_loc = fsrc_loc.splitlines(keepends=True)
+        final_lines_loc = fscan.simplify_integer_arithmetic_in_lines(final_lines_loc)
         final_lines_loc = fpost.combine_blank_write_with_following_character_write(
             final_lines_loc
         )

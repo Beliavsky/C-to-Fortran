@@ -184,7 +184,7 @@ def combine_blank_write_with_following_character_write(lines: List[str]) -> List
 
 
 def remove_parentheses_around_variable_references(lines: List[str]) -> List[str]:
-    """Remove grouping parentheses around scalar names and component chains.
+    """Remove redundant grouping parentheses from references and arguments.
 
     Required call, indexing, and control-statement parentheses are retained.
     String literals and comments are not modified.
@@ -193,8 +193,133 @@ def remove_parentheses_around_variable_references(lines: List[str]) -> List[str]
         r"\(\s*([A-Za-z_][A-Za-z0-9_]*(?:%[A-Za-z_][A-Za-z0-9_]*)*)\s*\)"
     )
 
+    def _find_matching_paren(text: str, open_index: int) -> int:
+        depth = 0
+        quote = ""
+        i = open_index
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    if i + 1 < len(text) and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = ""
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _has_top_level_comma(text: str) -> bool:
+        depth = 0
+        quote = ""
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    if i + 1 < len(text) and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = ""
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                return True
+            i += 1
+        return False
+
+    def _unwrap_full_argument(argument: str) -> str:
+        leading = argument[: len(argument) - len(argument.lstrip())]
+        trailing = argument[len(argument.rstrip()) :]
+        core = argument.strip()
+        while core.startswith("("):
+            close = _find_matching_paren(core, 0)
+            if close != len(core) - 1:
+                break
+            interior = core[1:-1]
+            # A parenthesized comma expression may be a complex literal, so
+            # unwrapping it could turn one actual argument into two.
+            if _has_top_level_comma(interior):
+                break
+            core = interior.strip()
+        return f"{leading}{core}{trailing}"
+
+    def _unwrap_call_arguments(contents: str) -> str:
+        pieces: List[str] = []
+        start = 0
+        depth = 0
+        quote = ""
+        i = 0
+        while i < len(contents):
+            ch = contents[i]
+            if quote:
+                if ch == quote:
+                    if i + 1 < len(contents) and contents[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = ""
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                pieces.append(_unwrap_full_argument(contents[start:i]))
+                pieces.append(",")
+                start = i + 1
+            i += 1
+        pieces.append(_unwrap_full_argument(contents[start:]))
+        return "".join(pieces)
+
+    def _rewrite_nested_argument_wrappers(text: str) -> str:
+        out: List[str] = []
+        i = 0
+        while i < len(text):
+            if text[i] in "'\"":
+                quote = text[i]
+                start = i
+                i += 1
+                while i < len(text):
+                    if text[i] != quote:
+                        i += 1
+                        continue
+                    if i + 1 < len(text) and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                out.append(text[start:i])
+                continue
+            if text[i] != "(":
+                out.append(text[i])
+                i += 1
+                continue
+            close = _find_matching_paren(text, i)
+            if close < 0:
+                out.append(text[i:])
+                break
+            contents = _rewrite_nested_argument_wrappers(text[i + 1 : close])
+            prefix = "".join(out).rstrip()
+            if prefix and (prefix[-1].isalnum() or prefix[-1] in "_%])"):
+                contents = _unwrap_call_arguments(contents)
+            out.append(f"({contents})")
+            i = close + 1
+        return "".join(out)
+
     def _rewrite_code_segment(segment: str) -> str:
-        text = segment
+        text = _rewrite_nested_argument_wrappers(segment)
         while True:
             changed = False
             for match in reference_re.finditer(text):
