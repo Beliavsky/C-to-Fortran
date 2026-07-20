@@ -4882,6 +4882,9 @@ def transpile_c_to_fortran(
         fpost.simplify_logical_identities(out_text.splitlines(keepends=True))
     )
     out_text = "".join(
+        fpost.simplify_redundant_parentheses(out_text.splitlines(keepends=True))
+    )
+    out_text = "".join(
         fscan.simplify_constant_if_blocks(out_text.splitlines(keepends=True))
     )
     out_text = "".join(
@@ -6082,6 +6085,7 @@ def main() -> int:
         final_lines_loc = fscan.simplify_integer_arithmetic_in_lines(final_lines_loc)
         final_lines_loc = fscan.simplify_do_bounds_parens(final_lines_loc)
         final_lines_loc = fpost.simplify_logical_identities(final_lines_loc)
+        final_lines_loc = fpost.simplify_redundant_parentheses(final_lines_loc)
         final_lines_loc = fscan.simplify_constant_if_blocks(final_lines_loc)
         final_lines_loc = fpost.combine_blank_write_with_following_character_write(
             final_lines_loc

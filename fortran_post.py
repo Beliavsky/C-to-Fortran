@@ -1373,6 +1373,124 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
             i += 1
         return None
 
+    def _top_level_logical_operators(expr: str) -> List[str]:
+        operators: List[str] = []
+        depth = 0
+        in_single = False
+        in_double = False
+        low = expr.lower()
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(expr) and expr[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                if in_double and i + 1 < len(expr) and expr[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0:
+                matched = False
+                for operator in (".and.", ".or.", ".eqv.", ".neqv."):
+                    if low.startswith(operator, i):
+                        operators.append(operator)
+                        i += len(operator)
+                        matched = True
+                        break
+                if matched:
+                    continue
+            i += 1
+        return operators
+
+    def _strip_redundant_logical_operand_parens(expr: str) -> str:
+        """Drop logical-operand grouping when Fortran precedence preserves it."""
+        value = expr
+        while True:
+            stack: List[int] = []
+            pairs: List[tuple[int, int]] = []
+            in_single = False
+            in_double = False
+            i = 0
+            while i < len(value):
+                ch = value[i]
+                if ch == "'" and not in_double:
+                    if in_single and i + 1 < len(value) and value[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_single = not in_single
+                elif ch == '"' and not in_single:
+                    if in_double and i + 1 < len(value) and value[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_double = not in_double
+                elif not in_single and not in_double:
+                    if ch == "(":
+                        stack.append(i)
+                    elif ch == ")" and stack:
+                        pairs.append((stack.pop(), i))
+                i += 1
+
+            changed = False
+            for opening, closing in reversed(pairs):
+                before = value[:opening].rstrip()
+                after = value[closing + 1 :].lstrip()
+                if before.lower().endswith(".not."):
+                    continue
+                previous = before[-1] if before else ""
+                # Keep syntactic call/control/index parentheses, including the
+                # required outer pair in IF (...).
+                if previous and (previous.isalnum() or previous in "_%])"):
+                    continue
+
+                inner = value[opening + 1 : closing].strip()
+                probe = fscan.strip_redundant_outer_parens_expr(inner)
+                if _has_top_level_comma(probe):
+                    continue
+                inner_ops = _top_level_logical_operators(probe)
+                remove = False
+                if not inner_ops and _split_top_level_relop(probe) is not None:
+                    remove = True
+                elif inner_ops and not any(op in {".eqv.", ".neqv."} for op in inner_ops):
+                    outer_ops: List[str] = []
+                    for operator in (".and.", ".or."):
+                        if before.lower().endswith(operator):
+                            outer_ops.append(operator)
+                        if after.lower().startswith(operator):
+                            outer_ops.append(operator)
+                    if outer_ops:
+                        inner_precedence = 1 if ".or." in inner_ops else 2
+                        # Parentheses are required only for OR nested directly
+                        # as an operand of the higher-precedence AND operator.
+                        remove = all(
+                            not (inner_precedence == 1 and operator == ".and.")
+                            for operator in outer_ops
+                        )
+                if not remove:
+                    continue
+                value = value[:opening] + probe + value[closing + 1 :]
+                changed = True
+                break
+            if not changed:
+                return value
+
     def _rewrite_safe_mul_self_to_pow2(expr: str) -> str:
         # Conservative: only rewrite simple scalar-like atoms, e.g. x*x, obj%v*obj%v.
         # Do not touch array refs/calls, character literals, or complex syntax.
@@ -1451,6 +1569,7 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
 
     def _simplify_assignment_rhs(rhs: str) -> str:
         value = fscan.strip_redundant_outer_parens_expr(rhs.rstrip())
+        value = _strip_redundant_logical_operand_parens(value)
         rel = _split_top_level_relop(value)
         if rel is not None:
             lhs_rel, op_rel, rhs_rel = rel
@@ -1520,6 +1639,7 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
                 cond = m_if.group(2).rstrip()
                 post = m_if.group(3)
                 cond = fscan.strip_redundant_outer_parens_expr(cond)
+                cond = _strip_redundant_logical_operand_parens(cond)
                 cond = _rewrite_safe_mul_self_to_pow2(cond)
                 rel = _split_top_level_relop(cond)
                 if rel is not None:
