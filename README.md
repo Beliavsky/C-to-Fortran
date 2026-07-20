@@ -12,6 +12,10 @@ studying small numerical programs, but it is not a complete implementation of
 the C language. Generated code should be reviewed and tested before production
 use.
 
+See the [C-to-Fortran language mapping](docs/c-to-fortran-mapping.md) for
+side-by-side syntax examples, translation conventions, and current
+restrictions.
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -183,4 +187,3 @@ pytest -q -m corpus
 - Some compiler flags are GNU-specific.
 - Legacy K&R C sources may require an older dialect such as `-std=gnu89` when
   compiled with a recent GCC.
-
