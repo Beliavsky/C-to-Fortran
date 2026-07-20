@@ -468,6 +468,8 @@ def c_to_ftype(type_decl: c_ast.Node) -> Tuple[str, bool]:
             return "void", alloc
         if "char" in names:
             return "character(len=*)", False
+        if any(name in {"int64_t", "uint64_t"} for name in names):
+            return "integer(kind=int64)", alloc
         if "double" in names:
             return "real(kind=dp)", alloc
         if "complex_double" in names:
@@ -1063,6 +1065,13 @@ def _body_has_unsigned_locals(body: c_ast.Node) -> bool:
     return any(info.unsigned for info in probe.values())
 
 
+def _body_has_int64_locals(body: c_ast.Node) -> bool:
+    """True when the body declares a value represented with Fortran INT64."""
+    probe: Dict[str, VarInfo] = {}
+    gather_decls(body, probe)
+    return any("int64" in info.ftype.lower() for info in probe.values())
+
+
 def _subtree_has_funccall(node: c_ast.Node) -> bool:
     """True when the expression subtree contains any function call."""
     if isinstance(node, c_ast.FuncCall):
@@ -1379,6 +1388,34 @@ class Emitter:
             return None
         return f"{sign}{value}"
 
+    @classmethod
+    def _fortran_int_literal(cls, txt: str) -> Optional[str]:
+        """Render a C integer literal with a sufficient Fortran kind.
+
+        Fortran default-integer literals must themselves fit the default kind,
+        even when the surrounding expression has an INT64 operand. C ``long
+        long`` constants and other values outside the signed 32-bit range are
+        therefore given an explicit ``int64`` suffix. Unsigned 64-bit bit
+        patterns above ``huge(0_int64)`` use their signed two's-complement
+        representation, which preserves their bits for the supported bitwise
+        and wraparound-style translations.
+        """
+        normalized = cls._normalize_int_literal(txt)
+        if normalized is None:
+            return None
+        match = re.match(
+            r"^[+-]?(?:0[xX][0-9a-fA-F]+|0[0-7]+|\d+)(?P<suffix>[uUlL]*)$",
+            txt.strip(),
+        )
+        suffix = match.group("suffix").lower() if match is not None else ""
+        value = int(normalized)
+        needs_int64 = "ll" in suffix or not (-2147483648 <= value <= 2147483647)
+        if not needs_int64:
+            return normalized
+        if "u" in suffix and 9223372036854775807 < value <= 18446744073709551615:
+            value -= 18446744073709551616
+        return f"{value}_int64"
+
     @staticmethod
     def _decode_char_constant(token: str) -> str:
         """Translate a C character constant to a Fortran character expression."""
@@ -1541,7 +1578,7 @@ class Emitter:
                 return self._decode_char_constant(n.value)
             txt = n.value
             if n.type == "int" or re.match(r"^[+-]?\d", txt):
-                normalized = self._normalize_int_literal(txt)
+                normalized = self._fortran_int_literal(txt)
                 if normalized is not None:
                     return normalized
             # Normalize C float suffixes (e.g. 0.0f, 1e-3F) to Fortran-real literals.
@@ -3769,7 +3806,14 @@ def emit_function(
         ieee_imports.append("ieee_is_nan")
     is_recursive = name in collect_called_names(fn.body, {name})
 
-    need_int64 = ast_uses_any_id(fn.body, {"UINT_MAX", "LONG_MAX"}) or _body_has_unsigned_locals(fn.body)
+    return_ftype, _return_alloc = c_to_ftype(fdecl.type)
+    need_int64 = (
+        ast_uses_any_id(fn.body, {"UINT_MAX", "LONG_MAX"})
+        or _body_has_unsigned_locals(fn.body)
+        or _body_has_int64_locals(fn.body)
+        or "int64" in return_ftype.lower()
+        or any("int64" in c_to_ftype(param.type)[0].lower() for param in params)
+    )
 
     if name == "main":
         em.emit("program main")
@@ -3859,17 +3903,20 @@ def emit_function(
     out_idx = em.array_result_funcs.get(name, None)
     out_param_name: Optional[str] = None
     out_c_param_name: Optional[str] = None
-    # C by-value scalar params reassigned in the body are local copies, not
-    # outputs: pass them as `<name>_arg` (intent(in)) and copy into a local.
+    # C by-value scalar params modified directly or through their address are
+    # local copies, not outputs: pass them as `<name>_arg` (intent(in)) and
+    # copy into a local. Writable-call propagation catches patterns such as
+    # `normal_random(&seed)` that the direct assignment scan cannot see.
     copy_in_params: Dict[str, str] = {}
-    for p in params:
+    writable_param_indexes = em.writable_param_funcs.get(name, set())
+    for param_index, p in enumerate(params):
         if not p.name or type_is_ptr_or_array(p.type) or _is_funcptr_param(p):
             continue
         p_ft_probe, _ = c_to_ftype(p.type)
         if p_ft_probe.lower().startswith("character"):
             continue
         _has_r, has_w = _scan_dummy_usage(fn.body, p.name)
-        if has_w:
+        if has_w or param_index in writable_param_indexes:
             copy_in_params[p.name] = f"{p.name}_arg"
     funcptr_dummy_names: Dict[str, str] = {}
     funcptr_dummy_ifaces: Dict[str, str] = {}
@@ -5892,10 +5939,17 @@ def inline_single_use_temp_assignments(lines: List[str]) -> List[str]:
         # Never inline TARGET/POINTER entities: their identity matters for
         # pointer association (e.g. structure constructors linking nodes).
         protected: Set[str] = set()
+        intent_in_dummies: Set[str] = set()
         for k in range(us, ue + 1):
             dcode = fscan.strip_comment(out[k]).strip()
             if "::" in dcode and re.search(r"\btarget\b|\bpointer\b", dcode.split("::", 1)[0], re.IGNORECASE):
                 protected.update(fscan.parse_declared_names_from_decl(dcode))
+            if "::" in dcode and re.search(
+                r"\bintent\s*\(\s*in\s*\)",
+                dcode.split("::", 1)[0],
+                re.IGNORECASE,
+            ):
+                intent_in_dummies.update(fscan.parse_declared_names_from_decl(dcode))
         removed_vars: Set[str] = set()
         i = us
         while i <= ue:
@@ -5911,6 +5965,12 @@ def inline_single_use_temp_assignments(lines: List[str]) -> List[str]:
                 i += 1
                 continue
             rhs = m_as.group(2).strip()
+            # `local = dummy` may be the deliberate copy that preserves C
+            # pass-by-value semantics before local is passed to an INOUT
+            # procedure. Inlining it would illegally mutate INTENT(IN).
+            if rhs.lower() in intent_in_dummies:
+                i += 1
+                continue
             if any(tok.group(0).lower() == var for tok in ident_re.finditer(rhs)):
                 i += 1
                 continue

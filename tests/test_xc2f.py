@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -373,6 +374,37 @@ def test_isnan_condition_uses_logical_ieee_intrinsic() -> None:
     assert "if (.not. (ieee_is_nan(xvalue))) stop" in fortran
     assert "ieee_is_nan(xvalue) /= 0" not in fortran
     assert "ieee_is_nan(xvalue) == 0" not in fortran
+
+
+def test_uint64_lcg_uses_int64_declaration_and_literals() -> None:
+    source = """
+    #include <stdint.h>
+    uint64_t advance(uint64_t *state) {
+        *state = 6364136223846793005ULL * (*state)
+               + 1442695040888963407ULL;
+        return *state;
+    }
+    uint64_t sample(uint64_t seed) {
+        return advance(&seed);
+    }
+    int main(void) {
+        uint64_t state = 123456789ULL;
+        sample(state);
+        return 0;
+    }
+    """
+
+    fortran = xc2f.transpile_c_to_fortran(source)
+
+    assert "use, intrinsic :: iso_fortran_env, only: int64" in fortran
+    assert "integer(kind=int64), intent(inout) :: state" in fortran
+    assert "integer(kind=int64) :: advance_result" in fortran
+    assert "6364136223846793005_int64" in fortran
+    assert "1442695040888963407_int64" in fortran
+    assert "function sample(seed_arg)" in fortran
+    assert "integer(kind=int64), intent(in) :: seed_arg" in fortran
+    assert re.search(r"integer\(kind=int64\)\s*::[^\n]*\bseed\b", fortran)
+    assert "seed = seed_arg" in fortran
 
 
 def test_logical_not_of_integer_function_compares_with_zero() -> None:
