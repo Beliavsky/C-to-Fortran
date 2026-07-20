@@ -1660,7 +1660,49 @@ def compact_repeated_edit_descriptors(lines: List[str]) -> List[str]:
     return out
 
 
-def _fold_simple_integer_arithmetic(stmt: str) -> str:
+def _fold_symbolic_integer_offsets(stmt: str, int_names: Set[str]) -> str:
+    """Combine constant offsets around a declared integer variable.
+
+    The generated array-index adjustment commonly produces ``(n - 1)+1``.
+    Restricting the rewrite to locally declared integer names avoids changing
+    the evaluation of analogous real-valued expressions.
+    """
+    if not int_names:
+        return stmt
+
+    pat = re.compile(
+        r"(?<![\w%])\(\s*(?P<name>[a-z][a-z0-9_]*)\s*"
+        r"(?P<inner>[+\-])\s*(?P<inner_offset>\d+)\s*\)\s*"
+        r"(?P<outer>[+\-])\s*(?P<outer_offset>\d+)(?![\w.])",
+        re.IGNORECASE,
+    )
+
+    def _repl(m: re.Match[str]) -> str:
+        if m.group("name").lower() not in int_names:
+            return m.group(0)
+        inner_offset = int(m.group("inner_offset"))
+        outer_offset = int(m.group("outer_offset"))
+        if m.group("inner") == "-":
+            inner_offset = -inner_offset
+        if m.group("outer") == "-":
+            outer_offset = -outer_offset
+        offset = inner_offset + outer_offset
+        if offset == 0:
+            return m.group("name")
+        operator = "+" if offset > 0 else "-"
+        return f"{m.group('name')}{operator}{abs(offset)}"
+
+    prev = None
+    out = stmt
+    while prev != out:
+        prev = out
+        out = pat.sub(_repl, out)
+    return out
+
+
+def _fold_simple_integer_arithmetic(
+    stmt: str, int_names: Optional[Set[str]] = None
+) -> str:
     """Fold very simple integer-literal arithmetic conservatively.
 
     Supported form: `<int> <op> <int>` where op is +, -, *, /.
@@ -1708,20 +1750,64 @@ def _fold_simple_integer_arithmetic(stmt: str) -> str:
     while prev != out:
         prev = out
         out = pat.sub(_repl, out)
-    return out
+    return _fold_symbolic_integer_offsets(out, int_names or set())
 
 
-def simplify_integer_arithmetic_in_line(line: str) -> str:
-    """Simplify integer-literal arithmetic in one Fortran source line."""
+def simplify_integer_arithmetic_in_line(
+    line: str, int_names: Optional[Set[str]] = None
+) -> str:
+    """Simplify provably integer arithmetic in one Fortran source line."""
     code, comment = _split_code_comment(line.rstrip("\r\n"))
     eol = _line_eol(line)
-    code = _fold_simple_integer_arithmetic(code)
+    code = _fold_simple_integer_arithmetic(code, int_names)
     return f"{code}{comment}{eol}"
 
 
 def simplify_integer_arithmetic_in_lines(lines: List[str]) -> List[str]:
-    """Apply simple integer-literal arithmetic folding to source lines."""
-    return [simplify_integer_arithmetic_in_line(ln) for ln in lines]
+    """Apply conservative integer arithmetic folding to Fortran source."""
+    out = list(lines)
+    unit_start_re = re.compile(
+        r"^\s*(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(
+        r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE
+    )
+
+    # Associate each line with its program unit.  Names are collected before
+    # rewriting because declarations precede, but do not necessarily sit next
+    # to, the generated expressions that use them.
+    unit_ranges: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for i, raw in enumerate(out):
+        code = strip_comment(raw).strip()
+        if not code:
+            continue
+        if start is not None and unit_end_re.match(code):
+            unit_ranges.append((start, i))
+            start = None
+        elif start is None and unit_start_re.match(code):
+            start = i
+    if start is not None:
+        unit_ranges.append((start, len(out) - 1))
+
+    covered: Set[int] = set()
+    for first, last in unit_ranges:
+        int_names: Set[str] = set()
+        for i in range(first, last + 1):
+            code = strip_comment(out[i]).strip()
+            if re.match(r"^integer\b", code, re.IGNORECASE):
+                int_names.update(parse_declared_names_from_decl(code))
+        for i in range(first, last + 1):
+            out[i] = simplify_integer_arithmetic_in_line(out[i], int_names)
+            covered.add(i)
+
+    # Retain literal-only folding for module declarations and other source
+    # outside executable program units.
+    for i in range(len(out)):
+        if i not in covered:
+            out[i] = simplify_integer_arithmetic_in_line(out[i])
+    return out
 
 
 def simplify_square_multiplications_in_line(line: str) -> str:
