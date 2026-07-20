@@ -4801,7 +4801,7 @@ def transpile_c_to_fortran(
         return out_text
 
     lines = fscan.demote_fixed_size_single_allocatables(lines)
-    lines = _coalesce_simple_declarations_preserve_intent(lines)
+    lines = _coalesce_declarations_without_comments(lines)
     lines = fscan.coalesce_adjacent_allocate_statements(lines, max_len=80)
     lines = move_decl_comments_to_after_signature(lines)
     lines = move_inits_below_early_guard(lines)
@@ -4871,9 +4871,11 @@ def transpile_c_to_fortran(
     out_text = "".join(fpost.tighten_unary_minus_literal_spacing(out_text.splitlines(keepends=True)))
     out_text = "".join(fpost.normalize_delimiter_inner_spacing(out_text.splitlines(keepends=True)))
     out_text = "".join(fpost.simplify_bfgs_rank1_update(out_text.splitlines(keepends=True)))
-    out_text = "".join(fscan.simplify_do_bounds_parens(out_text.splitlines(keepends=True)))
     out_text = "".join(
         fscan.simplify_integer_arithmetic_in_lines(out_text.splitlines(keepends=True))
+    )
+    out_text = "".join(
+        fscan.simplify_do_bounds_parens(out_text.splitlines(keepends=True))
     )
     out_text = "".join(
         fpost.simplify_logical_identities(out_text.splitlines(keepends=True))
@@ -5233,22 +5235,9 @@ def _remove_arg_style_doc_comments(lines: List[str]) -> List[str]:
     return out
 
 
-def _coalesce_simple_declarations_preserve_intent(lines: List[str]) -> List[str]:
-    """Coalesce declarations, but keep dummy-arg `intent(...)` lines untouched."""
-    out: List[str] = []
-    buf: List[str] = []
-    intent_re = re.compile(r"\bintent\s*\(", re.IGNORECASE)
-    for ln in lines:
-        if intent_re.search(ln):
-            if buf:
-                out.extend(fscan.coalesce_simple_declarations(buf))
-                buf = []
-            out.append(ln)
-        else:
-            buf.append(ln)
-    if buf:
-        out.extend(fscan.coalesce_simple_declarations(buf))
-    return out
+def _coalesce_declarations_without_comments(lines: List[str]) -> List[str]:
+    """Coalesce adjacent identical declarations that have no trailing comments."""
+    return fscan.coalesce_simple_declarations(lines)
 
 
 def _detect_c_real_precision(src_no_comments: str) -> str:
@@ -6060,7 +6049,7 @@ def main() -> int:
         post_lines_loc = fpost.tighten_size_alias_nonpositive_guards(post_lines_loc)
         post_lines_loc = inline_single_use_temp_assignments(post_lines_loc)
         post_lines_loc = fpost.remove_unused_local_declarations(post_lines_loc)
-        post_lines_loc = _coalesce_simple_declarations_preserve_intent(post_lines_loc)
+        post_lines_loc = _coalesce_declarations_without_comments(post_lines_loc)
         post_lines_loc = fscan.remove_redundant_int_casts(post_lines_loc)
         post_lines_loc = fscan.remove_redundant_real_casts(post_lines_loc)
         post_lines_loc = fscan.suffix_real_literals_with_kind(post_lines_loc, kind_name="dp")
@@ -6077,7 +6066,7 @@ def main() -> int:
             post_lines_loc = fpost.tighten_size_alias_nonpositive_guards(post_lines_loc)
             post_lines_loc = inline_single_use_temp_assignments(post_lines_loc)
             post_lines_loc = fpost.remove_unused_local_declarations(post_lines_loc)
-            post_lines_loc = _coalesce_simple_declarations_preserve_intent(post_lines_loc)
+            post_lines_loc = _coalesce_declarations_without_comments(post_lines_loc)
             post_lines_loc = fscan.remove_redundant_int_casts(post_lines_loc)
             post_lines_loc = fscan.remove_redundant_real_casts(post_lines_loc)
             post_lines_loc = fscan.suffix_real_literals_with_kind(post_lines_loc, kind_name="dp")
@@ -6087,6 +6076,7 @@ def main() -> int:
             fsrc_loc = _normalize_kind_intrinsic_literals("".join(post_lines_loc))
         final_lines_loc = fsrc_loc.splitlines(keepends=True)
         final_lines_loc = fscan.simplify_integer_arithmetic_in_lines(final_lines_loc)
+        final_lines_loc = fscan.simplify_do_bounds_parens(final_lines_loc)
         final_lines_loc = fpost.simplify_logical_identities(final_lines_loc)
         final_lines_loc = fpost.combine_blank_write_with_following_character_write(
             final_lines_loc
