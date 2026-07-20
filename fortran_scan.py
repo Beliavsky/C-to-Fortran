@@ -1708,7 +1708,17 @@ def _fold_simple_integer_arithmetic(
     Supported form: `<int> <op> <int>` where op is +, -, *, /.
     Division folds only when exact and denominator is nonzero.
     """
-    pat = re.compile(r"(?<![\w.])([+-]?\d+)\s*([+\-*/])\s*([+-]?\d+)(?![\w.])")
+    integer_operand = r"(?:\(\s*[+-]?\d+\s*\)|[+-]?\d+)"
+    pat = re.compile(
+        rf"(?<![\w.])({integer_operand})\s*([+\-*/])\s*"
+        rf"({integer_operand})(?![\w.])"
+    )
+
+    def _integer_value(text: str) -> int:
+        value = text.strip()
+        if value.startswith("(") and value.endswith(")"):
+            value = value[1:-1].strip()
+        return int(value)
 
     def _repl(m: re.Match[str]) -> str:
         s = m.string
@@ -1730,9 +1740,9 @@ def _fold_simple_integer_arithmetic(
         if k < len(s) and s[k] in "+-*/":
             return m.group(0)
 
-        a = int(m.group(1))
+        a = _integer_value(m.group(1))
         op = m.group(2)
-        b = int(m.group(3))
+        b = _integer_value(m.group(3))
         if op == "+":
             return str(a + b)
         if op == "-":
@@ -2805,18 +2815,9 @@ def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[st
             if len(merged) <= max_len:
                 out.append(f"{merged}{eol}")
             else:
-                first = f"{indent}{spec} :: {names[0]}, &"
-                if len(first) <= max_len:
-                    out.append(f"{first}{eol}")
-                    start_idx = 1
-                else:
-                    out.append(f"{indent}{spec} :: &{eol}")
-                    start_idx = 0
-                for k in range(start_idx, len(names)):
-                    nm = names[k]
-                    is_last = (k == len(names) - 1)
-                    tail = "" if is_last else ", &"
-                    out.append(f"{indent}   & {nm}{tail}{eol}")
+                out.extend(
+                    wrap_long_declaration_lines([f"{merged}{eol}"], max_len=max_len)
+                )
         i = j
     def _consume_statement(src: List[str], start: int) -> Tuple[int, str, bool, str, List[str]]:
         """Consume one free-form statement with continuation lines."""
@@ -2980,7 +2981,12 @@ def wrap_long_declaration_lines(lines: List[str], max_len: int = 80) -> List[str
             ent_chunks[-1] = cur[:-1].rstrip()
             ent_chunks.append(ms.group(1).strip())
         if j > i:
-            cleaned = ", ".join(s.strip().rstrip(",") for s in ent_chunks if s.strip())
+            cleaned_chunks: List[str] = []
+            for chunk in ent_chunks:
+                cleaned_chunk = chunk.strip().rstrip(",").strip()
+                if cleaned_chunk:
+                    cleaned_chunks.append(cleaned_chunk)
+            cleaned = ", ".join(cleaned_chunks)
             ent_text = cleaned
             i = j
 
@@ -2999,9 +3005,13 @@ def wrap_long_declaration_lines(lines: List[str], max_len: int = 80) -> List[str
         rows: List[List[str]] = []
         cur: List[str] = []
         cur_prefix = first_prefix
-        for ent in ents:
+        for ent_index, ent in enumerate(ents):
             trial = ", ".join(cur + [ent])
-            if len(cur_prefix + trial) <= max_len or not cur:
+            continuation_suffix_len = 3 if ent_index < len(ents) - 1 else 0
+            if (
+                len(cur_prefix + trial) + continuation_suffix_len <= max_len
+                or not cur
+            ):
                 cur.append(ent)
             else:
                 rows.append(cur)
