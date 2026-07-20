@@ -89,6 +89,10 @@ DEBUG_GFORTRAN_FLAGS = [
     "-finit-integer=-999999",
 ]
 
+# Style-only transformation: prefer idiomatic one-based loops when the loop
+# body can be shifted conservatively.  API and CLI callers may disable it.
+NORMALIZE_ARRAY_LOOPS_TO_ONE_BASED = True
+
 
 def gfortran_flags(*, debug: bool = False) -> List[str]:
     """Return compiler flags, adding full runtime diagnostics for --debug."""
@@ -4426,6 +4430,7 @@ def transpile_c_to_fortran(
     raw: bool = False,
     pure: bool = True,
     elemental: bool = False,
+    one_based_loops: bool = NORMALIZE_ARRAY_LOOPS_TO_ONE_BASED,
 ) -> str:
     no_pp = strip_preprocessor_only(text)
     comments = extract_preserved_comments(no_pp)
@@ -4836,7 +4841,8 @@ def transpile_c_to_fortran(
     lines = inline_single_use_temp_assignments(lines)
     lines = fpost.inline_temp_into_function_result(lines)
     lines = fpost.remove_redundant_self_assignments(lines)
-    lines = fpost.normalize_shifted_index_loops(lines)
+    if one_based_loops:
+        lines = fpost.normalize_shifted_index_loops(lines)
     lines = fpost.remove_redundant_size_dummy_args(lines)
     lines = fpost.hoist_repeated_open_file_literals(lines)
     lines = apply_dead_store_cleanup(lines)
@@ -5972,6 +5978,20 @@ def main() -> int:
     ap.add_argument("--tee-both", action="store_true", help="Print original C source and generated Fortran")
     ap.add_argument("--raw", action="store_true", help="Emit raw transpilation output (skip optional post-processing)")
     ap.add_argument("--refactor", action="store_true", help="Extract long main-program blocks into module procedures")
+    loop_style_group = ap.add_mutually_exclusive_group()
+    loop_style_group.add_argument(
+        "--one-based-loops",
+        dest="one_based_loops",
+        action="store_true",
+        help="Normalize eligible array-index loops to one-based bounds (default)",
+    )
+    loop_style_group.add_argument(
+        "--no-one-based-loops",
+        dest="one_based_loops",
+        action="store_false",
+        help="Keep emitted loop bounds in their translated zero-based form",
+    )
+    ap.set_defaults(one_based_loops=NORMALIZE_ARRAY_LOOPS_TO_ONE_BASED)
     purity_group = ap.add_mutually_exclusive_group()
     purity_group.add_argument(
         "--pure",
@@ -6064,6 +6084,7 @@ def main() -> int:
             raw=args.raw,
             pure=args.pure,
             elemental=args.elemental,
+            one_based_loops=args.one_based_loops,
         )
         if args.array:
             fsrc_loc = apply_xarray_postprocess(fsrc_loc, inline=args.array_inline)

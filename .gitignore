@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Native and Fortran build products
+*.exe
+*.mod
+*.o
+*.obj
+*.bat
+
+# Generated working files and batch output
+/temp.f90
+/temp.txt
+/temp_temp.txt
+/Trace.out
+/xc2f_batch_out/
+/*.f90
+*.zip
+
+# Publish the root C corpus used by pytest, not local scratch examples
+/*.c
+!/xnumerical.c
+!/xmv_mix.c
+!/xmatrix_stats.c
+
+# Local diagnostics and editor backups
+/#*#
+*.asv
+/errors_*.txt
+/copyod.bat
+/data.txt
+/do.txt
+/msg.txt

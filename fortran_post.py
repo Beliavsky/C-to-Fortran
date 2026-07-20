@@ -2146,8 +2146,9 @@ def tighten_size_alias_nonpositive_guards(lines: List[str]) -> List[str]:
 def normalize_shifted_index_loops(lines: List[str]) -> List[str]:
     """Rewrite shifted-index loops to idiomatic 1-based forms.
 
-    Conservative rewrite: only applies when, inside the loop body, every
-    occurrence of loop variable `i` appears as `i+1` (with optional spaces).
+    Conservative rewrite: applies when shifted ``i+1`` array-style uses are at
+    least as common as remaining zero-based uses.  Shifted uses become ``i``;
+    remaining uses become ``(i - 1)``.
 
     Supported header rewrites:
     - `do i = 1, n-1` -> `do i = 2, n`
@@ -2202,19 +2203,30 @@ def normalize_shifted_index_loops(lines: List[str]) -> List[str]:
             re.IGNORECASE,
         )
         pat_id = re.compile(rf"\b{re.escape(ivar)}\b", re.IGNORECASE)
-        saw_plus = False
+        real_offset_re = re.compile(
+            rf"\b{re.escape(ivar)}\s*[+\-]\s*\d+\.\d", re.IGNORECASE
+        )
+        modifies_ivar_re = re.compile(
+            rf"^\s*{re.escape(ivar)}\s*(?:=|[+\-*/]=)", re.IGNORECASE
+        )
+        shifted_count = 0
+        remaining_count = 0
         safe = True
         for k in range(i + 1, j):
             code_k, _comment_k = xunused.split_code_comment(out[k].rstrip("\r\n"))
             if not code_k.strip():
                 continue
-            if pat_plus.search(code_k):
-                saw_plus = True
-            code_removed = pat_plus.sub("", code_k)
-            if pat_id.search(code_removed):
+            if real_offset_re.search(code_k) or modifies_ivar_re.match(code_k):
                 safe = False
                 break
-        if not safe or not saw_plus:
+            shifted_count += len(pat_plus.findall(code_k))
+            code_removed = pat_plus.sub("", code_k)
+            remaining_count += len(pat_id.findall(code_removed))
+        if (
+            not safe
+            or shifted_count == 0
+            or remaining_count > shifted_count
+        ):
             i = j + 1
             continue
 
@@ -2225,7 +2237,10 @@ def normalize_shifted_index_loops(lines: List[str]) -> List[str]:
             code_k, comment_k = xunused.split_code_comment(out[k].rstrip("\r\n"))
             if not code_k.strip():
                 continue
-            new_code = pat_plus.sub(ivar, code_k)
+            placeholder = "c2f_shifted_loop_index"
+            protected = pat_plus.sub(placeholder, code_k)
+            new_code = pat_id.sub(f"({ivar} - 1)", protected)
+            new_code = new_code.replace(placeholder, ivar)
             eol_k = "\n" if out[k].endswith("\n") else ""
             out[k] = f"{new_code}{comment_k}{eol_k}"
         i = j + 1

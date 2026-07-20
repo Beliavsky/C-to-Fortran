@@ -369,7 +369,14 @@ def maybe_finding(path: Path, loop: LoopCtx, end_line: int) -> Optional[Finding]
         replacement_item = f"({out_items[0]}, {item_raw}, {loop.var} = {lb_fmt}, {ub_fmt})"
     if replacement_item is None:
         return None
-    suggestion = f"write ({unit_expr}, {collapse_fmt_expr(fmt_expr)}) {replacement_item}"
+    # Collapsing the loop must preserve the original non-advancing I/O
+    # semantics.  In particular, a following putchar('\\n')/blank WRITE is
+    # responsible for terminating the record; advancing here would introduce
+    # an extra blank line.
+    suggestion = (
+        f'write ({unit_expr}, {collapse_fmt_expr(fmt_expr)}, advance="no") '
+        f"{replacement_item}"
+    )
     return Finding(
         path=path,
         line_start=loop.start_line,

@@ -122,3 +122,59 @@ def test_compile_forwards_fortran_only_mode(tmp_path, monkeypatch) -> None:
     assert len(commands) == 1
     assert "--compile" in commands[0]
     assert "--compile-both" not in commands[0]
+
+
+def test_debug_option_is_forwarded(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "hello.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(xc2f_batch, "_expand_inputs", lambda inputs: [source])
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command) or completed(command),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "xc2f_batch.py",
+            "*.c",
+            "--compile",
+            "--debug",
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert xc2f_batch.main() == 0
+    assert "--debug" in commands[0]
+
+
+def test_no_pure_option_is_forwarded(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "hello.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(xc2f_batch, "_expand_inputs", lambda inputs: [source])
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command) or completed(command),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "xc2f_batch.py",
+            "*.c",
+            "--compile",
+            "--no-pure",
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert xc2f_batch.main() == 0
+    assert "--no-pure" in commands[0]
