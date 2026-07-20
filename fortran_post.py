@@ -457,7 +457,12 @@ def normalize_delimiter_inner_spacing(lines: List[str]) -> List[str]:
 
 
 def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
-    """Hoist simple procedure-level `use mod, only: ...` into module scope."""
+    """Hoist procedure-level ``use ..., only:`` imports into module scope.
+
+    Unqualified imports retain the existing behavior.  Intrinsic imports are
+    hoisted only when the same intrinsic module is used by multiple contained
+    procedures, avoiding unnecessary module-wide imports for one-off uses.
+    """
     out = list(lines)
     mod_start_re = re.compile(r"^\s*module\s+([a-z][a-z0-9_]*)\b(?!\s*procedure\b)", re.IGNORECASE)
     mod_end_re = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
@@ -510,19 +515,27 @@ def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
         mod_end = j
 
         # Existing module-level use-only imports.
-        module_use_lines: Dict[str, int] = {}
-        module_syms: Dict[str, set[str]] = {}
+        module_use_lines: Dict[tuple[Optional[str], str], int] = {}
+        module_syms: Dict[tuple[Optional[str], str], set[str]] = {}
         use_indent = None
         insert_idx = None
         for k in range(i + 1, contains_idx):
             code_k, _ = xunused.split_code_comment(out[k].rstrip("\r\n"))
             mk = use_only_re.match(code_k.strip())
-            if mk is not None and mk.group("intrinsic") is None:
+            if mk is not None:
+                nature = (
+                    mk.group("intrinsic").lower()
+                    if mk.group("intrinsic") is not None
+                    else None
+                )
                 mod_nm = mk.group("mod").lower()
                 syms = _parse_syms(mk.group("syms"))
                 if syms:
-                    module_use_lines[mod_nm] = k
-                    module_syms.setdefault(mod_nm, set()).update(s.lower() for s in syms)
+                    key = (nature, mod_nm)
+                    module_use_lines[key] = k
+                    module_syms.setdefault(key, set()).update(
+                        s.lower() for s in syms
+                    )
                     if use_indent is None:
                         use_indent = re.match(r"^(\s*)", code_k).group(1)
             if insert_idx is None and implicit_none_re.match(code_k):
@@ -533,8 +546,9 @@ def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
             insert_idx = contains_idx
 
         # Scan procedures for hoistable use-only lines.
-        hoist: Dict[str, set[str]] = {}
-        remove_lines: set[int] = set()
+        candidate_syms: Dict[tuple[Optional[str], str], set[str]] = {}
+        candidate_lines: Dict[tuple[Optional[str], str], set[int]] = {}
+        candidate_procs: Dict[tuple[Optional[str], str], set[int]] = {}
         p = contains_idx + 1
         while p < mod_end:
             code_p = fscan.strip_comment(out[p]).strip()
@@ -545,31 +559,67 @@ def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
             while q < mod_end:
                 code_q, _ = xunused.split_code_comment(out[q].rstrip("\r\n"))
                 mq = use_only_re.match(code_q.strip())
-                if mq is not None and mq.group("intrinsic") is None:
+                if mq is not None:
+                    nature = (
+                        mq.group("intrinsic").lower()
+                        if mq.group("intrinsic") is not None
+                        else None
+                    )
                     mod_nm = mq.group("mod").lower()
                     syms = _parse_syms(mq.group("syms"))
                     if syms:
-                        hoist.setdefault(mod_nm, set()).update(s.lower() for s in syms)
-                        remove_lines.add(q)
+                        key = (nature, mod_nm)
+                        candidate_syms.setdefault(key, set()).update(
+                            s.lower() for s in syms
+                        )
+                        candidate_lines.setdefault(key, set()).add(q)
+                        candidate_procs.setdefault(key, set()).add(p)
                 if proc_end_re.match(fscan.strip_comment(out[q]).strip()):
                     break
                 q += 1
             p = q + 1
+
+        hoist: Dict[tuple[Optional[str], str], set[str]] = {}
+        remove_lines: set[int] = set()
+        for key, syms in candidate_syms.items():
+            nature, _mod_nm = key
+            if nature == "intrinsic" and len(candidate_procs.get(key, set())) < 2:
+                continue
+            # Keep the previous conservative behavior for an explicit
+            # NON_INTRINSIC qualifier; only unqualified and repeated intrinsic
+            # imports are promoted.
+            if nature == "non_intrinsic":
+                continue
+            hoist[key] = syms
+            remove_lines.update(candidate_lines.get(key, set()))
 
         if not hoist:
             i = mod_end + 1
             continue
 
         # Apply merged module use lists.
-        for mod_nm, syms in hoist.items():
-            merged = sorted(module_syms.get(mod_nm, set()).union(syms))
-            if mod_nm in module_use_lines:
-                k = module_use_lines[mod_nm]
+        for key, syms in hoist.items():
+            nature, mod_nm = key
+            merged = sorted(module_syms.get(key, set()).union(syms))
+            if key in module_use_lines:
+                k = module_use_lines[key]
                 eol = xunused.get_eol(out[k]) or ("\n" if out[k].endswith("\n") else "")
-                out[k] = f"{use_indent}use {mod_nm}, only: {', '.join(merged)}{eol}"
+                if nature is None:
+                    use_stmt = f"use {mod_nm}, only: {', '.join(merged)}"
+                else:
+                    use_stmt = (
+                        f"use, {nature} :: {mod_nm}, only: {', '.join(merged)}"
+                    )
+                out[k] = f"{use_indent}{use_stmt}{eol}"
             else:
                 eol = "\n" if any("\n" in ln or "\r" in ln for ln in out) else ""
-                out.insert(insert_idx, f"{use_indent}use {mod_nm}, only: {', '.join(merged)}{eol}")
+                if nature is None:
+                    use_stmt = f"use {mod_nm}, only: {', '.join(merged)}"
+                else:
+                    use_stmt = (
+                        f"use, {nature} :: {mod_nm}, only: {', '.join(merged)}"
+                    )
+                out.insert(insert_idx, f"{use_indent}{use_stmt}{eol}")
                 # Shift pending line numbers after insertion.
                 remove_lines = {ln + 1 if ln >= insert_idx else ln for ln in remove_lines}
                 insert_idx += 1
@@ -1814,7 +1864,8 @@ def remove_unused_local_declarations(lines: List[str]) -> List[str]:
 def _split_top_level_csv(text: str) -> List[str]:
     out: List[str] = []
     cur: List[str] = []
-    depth = 0
+    paren_depth = 0
+    bracket_depth = 0
     in_s = False
     in_d = False
     for ch in text:
@@ -1824,10 +1875,14 @@ def _split_top_level_csv(text: str) -> List[str]:
             in_d = not in_d
         elif not in_s and not in_d:
             if ch == "(":
-                depth += 1
-            elif ch == ")" and depth > 0:
-                depth -= 1
-            elif ch == "," and depth == 0:
+                paren_depth += 1
+            elif ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]" and bracket_depth > 0:
+                bracket_depth -= 1
+            elif ch == "," and paren_depth == 0 and bracket_depth == 0:
                 out.append("".join(cur).strip())
                 cur = []
                 continue
