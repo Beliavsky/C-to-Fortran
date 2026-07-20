@@ -1449,6 +1449,48 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
         )
         return pat.sub(lambda m: f"exp({m.group('c')} * {m.group('v')}**2)", expr)
 
+    def _simplify_assignment_rhs(rhs: str) -> str:
+        value = fscan.strip_redundant_outer_parens_expr(rhs.rstrip())
+        rel = _split_top_level_relop(value)
+        if rel is not None:
+            lhs_rel, op_rel, rhs_rel = rel
+            lhs_rel = fscan.strip_redundant_outer_parens_expr(lhs_rel)
+            rhs_rel = fscan.strip_redundant_outer_parens_expr(rhs_rel)
+            value = f"{lhs_rel} {op_rel} {rhs_rel}"
+        value = _rewrite_safe_mul_self_to_pow2(value)
+        return _rewrite_exp_linear_times_same(value)
+
+    def _matching_if_condition_close(code: str) -> int:
+        m = re.match(r"^\s*if\s*\(", code, re.IGNORECASE)
+        if m is None:
+            return -1
+        opening = code.find("(", m.start())
+        depth = 0
+        in_single = False
+        in_double = False
+        i = opening
+        while i < len(code):
+            ch = code[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(code) and code[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                if in_double and i + 1 < len(code) and code[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+            i += 1
+        return -1
+
     cleaned: List[str] = []
     for ln in out:
         code, comment = xunused.split_code_comment(ln.rstrip("\r\n"))
@@ -1456,12 +1498,21 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
         m_asn = re.match(r"^(\s*[^=]+?=\s*)(.+)$", code)
         if m_asn and "::" not in code and "=>" not in code and not re.match(r"^\s*(if|do|where|forall|select)\b", code, re.IGNORECASE):
             lhs = m_asn.group(1)
-            rhs = m_asn.group(2).rstrip()
-            rhs = fscan.strip_redundant_outer_parens_expr(rhs)
-            rhs = _rewrite_safe_mul_self_to_pow2(rhs)
-            rhs = _rewrite_exp_linear_times_same(rhs)
-            code = lhs + rhs
+            code = lhs + _simplify_assignment_rhs(m_asn.group(2))
         else:
+            # Simplify the assignment action of a one-line IF separately from
+            # its required condition parentheses.
+            close = _matching_if_condition_close(code)
+            if close >= 0:
+                tail = code[close + 1 :]
+                m_action = re.match(r"^(\s*[^=]+?=\s*)(.+)$", tail)
+                if m_action is not None and "=>" not in tail:
+                    code = (
+                        code[: close + 1]
+                        + m_action.group(1)
+                        + _simplify_assignment_rhs(m_action.group(2))
+                    )
+
             # Also simplify redundant parentheses inside IF conditions.
             m_if = re.match(r"^(\s*if\s*\()(.+)(\)\s*(?:then|return|cycle|exit|call\b.*)?)$", code, re.IGNORECASE)
             if m_if:
