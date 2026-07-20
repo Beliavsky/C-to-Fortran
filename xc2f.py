@@ -4828,6 +4828,7 @@ def transpile_c_to_fortran(
     lines = fpost.simplify_norm2_patterns(lines)
     lines = fpost.simplify_bfgs_rank1_update(lines)
     lines = fscan.simplify_integer_arithmetic_in_lines(lines)
+    lines = fscan.simplify_constant_if_blocks(lines)
     lines = fpost.collapse_single_stmt_if_blocks(lines)
     lines = fpost.simplify_do_while_true(lines)
     lines = fpost.ensure_blank_line_between_module_procedures(lines)
@@ -4879,6 +4880,9 @@ def transpile_c_to_fortran(
     )
     out_text = "".join(
         fpost.simplify_logical_identities(out_text.splitlines(keepends=True))
+    )
+    out_text = "".join(
+        fscan.simplify_constant_if_blocks(out_text.splitlines(keepends=True))
     )
     out_text = "".join(
         fpost.remove_parentheses_around_variable_references(
@@ -6078,6 +6082,7 @@ def main() -> int:
         final_lines_loc = fscan.simplify_integer_arithmetic_in_lines(final_lines_loc)
         final_lines_loc = fscan.simplify_do_bounds_parens(final_lines_loc)
         final_lines_loc = fpost.simplify_logical_identities(final_lines_loc)
+        final_lines_loc = fscan.simplify_constant_if_blocks(final_lines_loc)
         final_lines_loc = fpost.combine_blank_write_with_following_character_write(
             final_lines_loc
         )
