@@ -4502,6 +4502,25 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
                 rhs = ma.group(2).strip()
                 assign_count[name] = assign_count.get(name, 0) + 1
                 assign_rhs[name] = rhs
+            # One-line `if (...) x = value` also assigns x; count it so a
+            # conditionally reassigned variable is not promoted.
+            mif = re.match(r"^\s*if\s*\(", s, re.IGNORECASE)
+            if mif:
+                depth = 0
+                jj = s.index("(")
+                while jj < len(s):
+                    if s[jj] == "(":
+                        depth += 1
+                    elif s[jj] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    jj += 1
+                tail = s[jj + 1:].strip() if jj < len(s) else ""
+                ma_t = asn_re.match(tail)
+                if ma_t:
+                    tname = ma_t.group(1).lower()
+                    assign_count[tname] = assign_count.get(tname, 0) + 1
             # A scalar passed to a user function referenced inside an
             # expression may bind to an INTENT(OUT/INOUT) dummy just like a
             # `call` actual; keep such names as variables too. When the callee
@@ -4531,8 +4550,16 @@ def promote_scalar_constants_to_parameters(lines: List[str]) -> List[str]:
                     if ma_actual:
                         call_actuals.add(ma_actual.group(1).lower())
 
+        # Function RESULT variables can never be parameters.
+        result_names: Set[str] = set()
+        m_res = re.search(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", strip_comment(out[u_start]), re.IGNORECASE)
+        if m_res:
+            result_names.add(m_res.group(1).lower())
+
         promote: Dict[str, str] = {}
         for name, (_decl_i, _spec, _indent) in decl_info.items():
+            if name in result_names:
+                continue
             if do_assigned.__contains__(name):
                 continue
             if name in call_actuals:
@@ -5402,21 +5429,45 @@ def prune_unused_use_only_lines(lines: List[str]) -> List[str]:
     return [ln for ln in out if ln != ""]
 
 
-FORTRAN_RESERVED_IDENTIFIERS: Set[str] = {
-    # statements/keywords
-    "program", "module", "subroutine", "function", "contains", "implicit", "none",
-    "if", "then", "else", "end", "do", "select", "case", "where", "forall",
-    "call", "use", "only", "result", "integer", "real", "logical", "character",
-    "complex", "type", "class", "public", "private", "interface", "procedure",
-    "allocate", "deallocate", "return", "stop", "print", "read", "write", "open",
-    "close", "rewind", "backspace", "flush", "inquire", "intent", "in", "out",
-    "inout", "value", "optional", "allocatable", "pointer", "parameter", "save",
-    "target", "pure", "elemental", "recursive", "impure",
-    # common intrinsics often collided in transpiled names
+FORTRAN_KEYWORDS: Set[str] = {
+    # Fortran statement, declaration, attribute, and construct words. Fortran
+    # does not formally reserve every word in every context, but generated code
+    # avoids all of them for compiler/tool clarity.
+    "abstract", "allocatable", "allocate", "associate", "asynchronous",
+    "backspace", "bind", "block", "blockdata", "call", "case", "character",
+    "class", "close", "codimension", "common", "complex", "concurrent",
+    "contains", "contiguous", "continue", "critical", "cycle", "data",
+    "deallocate", "deferred", "dimension", "do", "double", "else", "elseif",
+    "elsewhere", "elemental", "end", "endassociate", "endblock", "endcritical",
+    "enddo", "endenum", "endfile", "endforall", "endfunction", "endif",
+    "endinterface", "endmodule", "endprocedure", "endprogram", "endselect",
+    "endsubmodule", "endsubroutine", "endteam", "endtype", "endwhere", "entry",
+    "enum", "enumerator", "equivalence", "error", "event", "exit", "extends",
+    "external", "final", "flush", "forall", "format", "function", "generic",
+    "goto", "if", "implicit", "import", "impure", "in", "include", "inout",
+    "inquire", "integer", "intent", "interface", "intrinsic", "lock", "logical",
+    "memory", "module", "namelist", "none", "non_overridable", "nopass",
+    "nullify", "only", "open", "operator", "optional", "out", "parameter",
+    "pass", "pause", "pointer", "precision", "print", "private", "procedure",
+    "program", "protected", "public", "pure", "rank", "read", "real",
+    "recursive", "result", "return", "rewind", "save", "select", "selectcase",
+    "selectrank", "selecttype", "sequence", "stop", "submodule", "subroutine",
+    "sync", "target", "team", "then", "type", "unlock", "use", "value",
+    "volatile", "wait", "where", "while", "write",
+}
+
+
+FORTRAN_INTRINSIC_IDENTIFIERS: Set[str] = {
+    # Legal identifiers that commonly cause intrinsic-shadowing ambiguity.
     "sum", "product", "minval", "maxval", "matmul", "transpose", "dot_product",
     "reshape", "spread", "pack", "count", "norm2", "abs", "sqrt", "floor", "mod",
     "int", "real", "size", "lbound", "ubound", "merge", "random_number", "random_seed",
 }
+
+
+FORTRAN_RESERVED_IDENTIFIERS: Set[str] = (
+    FORTRAN_KEYWORDS | FORTRAN_INTRINSIC_IDENTIFIERS
+)
 
 
 def _replace_identifiers_outside_strings(code: str, mapping: Dict[str, str]) -> str:
@@ -5688,24 +5739,35 @@ def find_set_but_never_read_local_edits(lines: List[str]) -> DeadStoreEdits:
 
         dead = [n for n in declared if n not in skip_names and writes.get(n) and not reads.get(n)]
         for n in dead:
-            dln = decl_line_by_name.get(n)
-            if dln is not None:
-                edits.decl_remove_by_line.setdefault(dln, set()).add(n)
+            removable: Set[int] = set()
+            kept_any = False
             for sln in sorted(assign_stmt_line_by_var.get(n, set())):
                 raw = lines[sln - 1]
                 code = strip_comment(raw).strip()
                 m_asn = assign_re.match(code)
                 if not m_asn:
+                    kept_any = True
                     continue
                 lhs = m_asn.group(1)
                 rhs = m_asn.group(2)
                 if base_identifier(lhs) != n:
+                    kept_any = True
                     continue
                 if ";" in code or "&" in code:
+                    kept_any = True
                     continue
                 if _rhs_has_disallowed_calls(rhs, declared):
+                    # The assignment stays (its RHS may have side effects), so
+                    # the declaration must stay too.
+                    kept_any = True
                     continue
-                edits.remove_stmt_lines.add(sln)
+                removable.add(sln)
+            if kept_any:
+                continue
+            dln = decl_line_by_name.get(n)
+            if dln is not None:
+                edits.decl_remove_by_line.setdefault(dln, set()).add(n)
+            edits.remove_stmt_lines.update(removable)
 
         i = j + 1
     return edits

@@ -148,6 +148,9 @@ _STRUCT_TYPEDEFS: Set[str] = set()
 # Struct name -> flexible-array-member field name (C `double data[];`).
 _STRUCT_FLEX_MEMBERS: Dict[str, str] = {}
 
+# Typedef names aliasing C function-pointer types.
+_FUNCPTR_TYPEDEFS: Set[str] = set()
+
 # Structs containing self-referential pointer members (linked lists, trees).
 _STRUCT_RECURSIVE: Set[str] = set()
 # Struct name -> its pointer-component field names.
@@ -438,6 +441,9 @@ def extract_c_function_header_comments(text: str) -> Dict[str, str]:
 
 def c_to_ftype(type_decl: c_ast.Node) -> Tuple[str, bool]:
     node = type_decl
+    if isinstance(node, c_ast.Typename):
+        # Cast target types arrive wrapped in a Typename.
+        node = node.type
     alloc = False
     ptr_depth = 0
     while isinstance(node, (c_ast.TypeDecl, c_ast.PtrDecl, c_ast.ArrayDecl)):
@@ -934,6 +940,18 @@ def collect_generic_macros(text: str) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def _is_funcptr_param(p: c_ast.Decl) -> bool:
+    """True for both spelled-out and typedef'd function-pointer parameters."""
+    if isinstance(p.type, c_ast.PtrDecl) and isinstance(p.type.type, c_ast.FuncDecl):
+        return True
+    node = p.type
+    while isinstance(node, c_ast.TypeDecl):
+        node = node.type
+    if isinstance(node, c_ast.IdentifierType):
+        return any(nm in _FUNCPTR_TYPEDEFS for nm in node.names)
+    return False
+
+
 def _has_void_ptr_param(fn: c_ast.FuncDef) -> bool:
     """True when the C function takes any `void *` parameter."""
     fdecl = fn.decl.type
@@ -1002,6 +1020,35 @@ def emit_qsort_helper(em: Emitter, kind: str) -> None:
     em.emit("   a(j+1) = key")
     em.emit("end do")
     em.emit(f"end subroutine c2f_sort_{kind}")
+
+
+def _deref_stores_array(body: c_ast.Node, pname: Optional[str], locals_map: Dict[str, VarInfo]) -> bool:
+    """True when `*pname = X` stores an array-valued local through pname."""
+    if not pname:
+        return False
+    array_locals = {
+        n.lower() for n, info in locals_map.items() if (info.alloc or info.shape) and not info.char_string
+    }
+    found = [False]
+
+    def visit(node: c_ast.Node) -> None:
+        if (
+            isinstance(node, c_ast.Assignment)
+            and node.op == "="
+            and isinstance(node.lvalue, c_ast.UnaryOp)
+            and node.lvalue.op == "*"
+            and isinstance(node.lvalue.expr, c_ast.ID)
+            and node.lvalue.expr.name == pname
+            and isinstance(node.rvalue, c_ast.ID)
+            and node.rvalue.name.lower() in array_locals
+        ):
+            found[0] = True
+        for _k, child in node.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(body)
+    return found[0]
 
 
 def _body_has_unsigned_locals(body: c_ast.Node) -> bool:
@@ -1194,8 +1241,19 @@ class Emitter:
         self.funcptr_arrays: Dict[str, str] = {}
         # Locals/dummies that are Fortran POINTERs to recursive-struct nodes.
         self.struct_ptr_names: Set[str] = set()
+        # C char* cursors into strings: lowercase cursor name -> base string
+        # name. A cursor is an integer position; *p reads base(p:p).
+        self.cursor_bases: Dict[str, str] = {}
+        # True while emitting a function whose result is a character string;
+        # `return NULL` then yields the NUL sentinel.
+        self.result_char_string: bool = False
+        # C functions with a non-void result: calling one as a statement needs
+        # a discard assignment, not CALL.
+        self.value_returning_funcs: Set[str] = set()
         self.array_result_name: Optional[str] = None
         self.array_result_tmp_alias: Optional[str] = None
+        self.pointer_return_result_name: Optional[str] = None
+        self.fscanf_iostat_name: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
         self.pointer_like_names: Set[str] = set()
         self.var_infos: Dict[str, VarInfo] = {}
@@ -1297,6 +1355,18 @@ class Emitter:
         for ref, nul in ((n.left, n.right), (n.right, n.left)):
             if not self._is_nul_char_constant(nul):
                 continue
+            # Cursor deref: `*p != '\0'` means the cursor is inside the string.
+            if (
+                isinstance(ref, c_ast.UnaryOp)
+                and ref.op == "*"
+                and isinstance(ref.expr, c_ast.ID)
+                and ref.expr.name.lower() in self.cursor_bases
+            ):
+                base = self.cursor_bases[ref.expr.name.lower()]
+                pos = self.expr(ref.expr)
+                if n.op == "!=":
+                    return f"({pos} <= len({base}))"
+                return f"({pos} > len({base}))"
             if not (
                 isinstance(ref, c_ast.ArrayRef)
                 and isinstance(ref.name, c_ast.ID)
@@ -1415,6 +1485,13 @@ class Emitter:
                 return "1"
             if n.name in _C_LIMIT_CONSTANTS:
                 return _C_LIMIT_CONSTANTS[n.name]
+            if n.name == "EOF":
+                return "(-1)"
+            if n.name == "errno":
+                # No errno model: reads are "no error".
+                return "0"
+            if n.name == "ERANGE":
+                return "34"
             if n.name == "stderr":
                 return "0"
             if n.name == "stdout":
@@ -1437,7 +1514,15 @@ class Emitter:
             target, _ = c_to_ftype(n.to_type)
             inner = self.expr(n.expr)
             tl = target.lower()
+            if tl.startswith("character"):
+                # (char)intexpr -> achar(); casting a char-valued expression
+                # (e.g. (unsigned char)*p) is the identity.
+                if self._is_char_valued(n.expr):
+                    return inner
+                return self.simp(f"achar({inner})")
             if tl.startswith("integer"):
+                if self._is_char_valued(n.expr):
+                    return self.simp(f"ichar({inner})")
                 return self.simp(f"int({inner})")
             if tl.startswith("real"):
                 mk = re.search(r"kind\s*=\s*([a-z_]\w*)", tl)
@@ -1453,6 +1538,11 @@ class Emitter:
             if op == "&":
                 return self.expr(n.expr)
             if op == "*":
+                # Dereferencing a string cursor reads one character.
+                if isinstance(n.expr, c_ast.ID) and n.expr.name.lower() in self.cursor_bases:
+                    base = self.cursor_bases[n.expr.name.lower()]
+                    pos = self.expr(n.expr)
+                    return f"{base}({pos}:{pos})"
                 # Explicit dereference of pointer arithmetic reads a single
                 # element: *(p + i) -> p((i)+1).
                 inner = n.expr
@@ -1503,6 +1593,35 @@ class Emitter:
                         if op == "==":
                             return f"(.not. associated({base}))"
                         return f"associated({base})"
+                # NULL checks on array entities are meaningless after lowering
+                # (an assumed-shape or allocatable is never "null"): constant.
+                for side, other in ((n.left, n.right), (n.right, n.left)):
+                    if (
+                        isinstance(other, c_ast.ID)
+                        and other.name == "NULL"
+                        and isinstance(side, c_ast.ID)
+                        and side.name.lower() in self.pointer_like_names
+                    ):
+                        return ".false." if op == "==" else ".true."
+                # A NULL char* is modeled as the one-char NUL sentinel string.
+                for side, other in ((n.left, n.right), (n.right, n.left)):
+                    if (
+                        isinstance(other, c_ast.ID)
+                        and other.name == "NULL"
+                        and isinstance(side, c_ast.ID)
+                        and side.name.lower() in self.char_string_names
+                    ):
+                        base = self.expr(side)
+                        cmp = "==" if op == "==" else "/="
+                        return f"({base} {cmp} achar(0))"
+                # Comparing an int variable with a character constant compares
+                # ordinals in C (e.g. `ch == '\n'`).
+                for side, other in ((n.left, n.right), (n.right, n.left)):
+                    if isinstance(other, c_ast.Constant) and other.type == "char" and not self._is_char_valued(side):
+                        ord_txt = self._char_constant_ordinal(other)
+                        if ord_txt is not None:
+                            cmp = "==" if op == "==" else "/="
+                            return self.simp(f"({self.expr(side)} {cmp} {ord_txt})")
                     if isinstance(other, c_ast.ID) and other.name == "NULL" and self._is_alloc_entity(side):
                         base = self.expr(side)
                         if op == "==":
@@ -1601,6 +1720,14 @@ class Emitter:
                     iexpr = self.expr(idx)
                     return f"{base}(({off}) + ({iexpr})+1)"
             name = self.expr(n.name)
+            # A base that rendered as a tail section (a pointer alias like
+            # `arr((off)+1:)`) must fold the element index into one subscript.
+            msec = re.match(r"^(.*)\(\((.*)\)\+1:\)$", name)
+            if msec is not None:
+                sec_base, sec_off = msec.group(1), msec.group(2)
+                if isinstance(idx, c_ast.UnaryOp) and idx.op == "p++":
+                    return f"{sec_base}(({sec_off}) + ({self.expr(idx.expr)})+1)"
+                return f"{sec_base}(({sec_off}) + ({self.expr(idx)})+1)"
             if isinstance(idx, c_ast.UnaryOp) and idx.op == "p++":
                 return f"{name}({self.expr(idx.expr)}+1)"
             return f"{name}({self.expr(idx)}+1)"
@@ -1636,8 +1763,29 @@ class Emitter:
                 return self.simp(f"abs({args[0]})")
             if fname == "isfinite" and len(args) == 1:
                 return f"ieee_is_finite({args[0]})"
+            if fname == "feof" and self.fscanf_iostat_name is not None:
+                return f"merge(1, 0, {self.fscanf_iostat_name} < 0)"
             if fname == "strlen" and len(args) == 1:
                 return self.simp(f"len_trim({args[0]})")
+            if fname == "fgetc" and len(args) == 1:
+                return f"c2f_fgetc({args[0]})"
+            if fname == "ferror" and len(args) == 1:
+                # No stream-error model: reads always report success.
+                return "0"
+            if fname in ("isspace", "isdigit", "isalpha") and n.args is not None and len(n.args.exprs) == 1:
+                # The helpers take a character code like the C originals.
+                a0 = args[0]
+                if self._is_char_valued(n.args.exprs[0]):
+                    a0 = f"ichar({a0})"
+                return f"c2f_{fname}({a0})"
+            if fname in ("strtof", "strtod") and n.args is not None and len(n.args.exprs) >= 2:
+                pos_node = n.args.exprs[0]
+                end_node = n.args.exprs[1]
+                if isinstance(end_node, c_ast.UnaryOp) and end_node.op == "&":
+                    end_node = end_node.expr
+                if isinstance(pos_node, c_ast.ID) and pos_node.name.lower() in self.cursor_bases:
+                    base = self.cursor_bases[pos_node.name.lower()]
+                    return f"c2f_strtof({base}, {self.expr(pos_node)}, {self.expr(end_node)})"
             if fname == "strcmp" and len(args) == 2:
                 a0, a1 = args
                 return self.simp(f"merge(-1, merge(1, 0, {a0} > {a1}), {a0} < {a1})")
@@ -2136,6 +2284,9 @@ class Emitter:
                 return "null()"
             if isinstance(node, c_ast.UnaryOp) and node.op == "&":
                 return self.expr(node.expr)
+        if shape == ":" and isinstance(node, c_ast.ID) and node.name == "NULL":
+            # Allocatable component: NULL means "not allocated".
+            return "null()"
         m = re.match(r"^type\(([^)]+)\)$", ftype, re.IGNORECASE)
         if m is not None and isinstance(node, c_ast.InitList) and m.group(1).lower() in self.struct_defs:
             return self._struct_constructor(m.group(1), node)
@@ -2176,6 +2327,35 @@ class Emitter:
             ]
         return f"{type_name}({', '.join(ordered)})"
 
+    @staticmethod
+    def _char_constant_ordinal(node: c_ast.Node) -> Optional[str]:
+        """Decode a C character constant to its ordinal value text."""
+        if not (isinstance(node, c_ast.Constant) and node.type == "char"):
+            return None
+        try:
+            value = ast.literal_eval(node.value)
+        except (SyntaxError, ValueError):
+            return None
+        if isinstance(value, str) and len(value) == 1:
+            return str(ord(value))
+        return None
+
+    def _is_char_valued(self, node: c_ast.Node) -> bool:
+        """True when the C expression yields a character value in Fortran."""
+        if isinstance(node, c_ast.Constant) and node.type in ("char", "string"):
+            return True
+        if isinstance(node, c_ast.ArrayRef) and isinstance(node.name, c_ast.ID):
+            return node.name.name.lower() in self.char_string_names
+        if isinstance(node, c_ast.ID):
+            info = self.var_infos.get(node.name.lower())
+            return info is not None and info.ftype.lower().startswith("character")
+        if isinstance(node, c_ast.UnaryOp) and node.op == "*" and isinstance(node.expr, c_ast.ID):
+            return node.expr.name.lower() in self.cursor_bases
+        if isinstance(node, c_ast.Cast):
+            target, _ = c_to_ftype(node.to_type)
+            return target.lower().startswith("character")
+        return False
+
     def _is_ptr_entity(self, node: c_ast.Node) -> bool:
         """True when the expression denotes a Fortran POINTER entity."""
         if isinstance(node, c_ast.ID):
@@ -2204,6 +2384,11 @@ class Emitter:
 
     def _emit_realloc_grow(self, lhs: str, fc: c_ast.FuncCall) -> None:
         """Emit allocatable growth (move_alloc) for a C realloc of `lhs`."""
+        vinfo_c = self.var_infos.get(lhs.lower())
+        if (vinfo_c is not None and vinfo_c.char_string) or lhs.lower() in self.char_string_names:
+            # Deferred-length strings grow on assignment; the C capacity dance
+            # is a no-op here.
+            return
         size_arg = fc.args.exprs[1]
         n = self._malloc_count_expr(size_arg)
         vinfo = self.var_infos.get(lhs.lower())
@@ -2267,6 +2452,30 @@ class Emitter:
             for pre in st.rvalue.exprs[:-1]:
                 self.emit_stmt(pre)
             self.emit(f"{self.expr(st.lvalue)} = {self.simp(self.expr(st.rvalue.exprs[-1]))}")
+            return
+
+        # Stores into a C string: growing single-char writes and the NUL
+        # terminator, which truncates in the exact-length model.
+        if (
+            st.op == "="
+            and isinstance(st.lvalue, c_ast.ArrayRef)
+            and isinstance(st.lvalue.name, c_ast.ID)
+            and st.lvalue.name.name.lower() in self.char_string_names
+        ):
+            s_name = st.lvalue.name.name
+            sub = st.lvalue.subscript
+            post_inc: Optional[str] = None
+            if isinstance(sub, c_ast.UnaryOp) and sub.op == "p++":
+                post_inc = self.expr(sub.expr)
+                idx = post_inc
+            else:
+                idx = self.expr(sub)
+            if self._is_nul_char_constant(st.rvalue):
+                self.emit(f"{s_name} = {s_name}(1:({idx}))")
+            else:
+                self.emit(f"call c2f_setchar({s_name}, ({idx})+1, {self.expr(st.rvalue)})")
+            if post_inc is not None:
+                self.emit(f"{post_inc} = {post_inc} + 1")
             return
 
         # Special: a[k++] = expr;
@@ -2591,6 +2800,20 @@ class Emitter:
                     # Pointer view aliases are substituted directly at uses.
                     return
                 info = self.var_infos.get((st.name or "").lower())
+                # A cursor initialized from its base string starts at column 1.
+                if st.name and st.name.lower() in self.cursor_bases and isinstance(st.init, c_ast.ID):
+                    if st.init.name.lower() not in self.cursor_bases:
+                        self.emit(f"{st.name} = 1")
+                        return
+                # `char *s = NULL` starts as the empty string so appends work.
+                if (
+                    info is not None
+                    and info.char_string
+                    and isinstance(st.init, c_ast.ID)
+                    and st.init.name == "NULL"
+                ):
+                    self.emit(f'{st.name} = ""')
+                    return
                 if info is not None and info.struct_ptr:
                     init = st.init.expr if isinstance(st.init, c_ast.Cast) else st.init
                     if isinstance(init, c_ast.ID) and init.name == "NULL":
@@ -2705,6 +2928,9 @@ class Emitter:
                 self.emit(f"{st.name} = {self.expr(st.init)}")
             return
         if isinstance(st, c_ast.Assignment):
+            # No errno model: stores to errno are dropped.
+            if isinstance(st.lvalue, c_ast.ID) and st.lvalue.name == "errno":
+                return
             # POINTER-entity targets use pointer assignment / allocation.
             if st.op == "=" and self._is_ptr_entity(st.lvalue):
                 lhs = self.expr(st.lvalue)
@@ -2741,10 +2967,24 @@ class Emitter:
             elif array_result_name is not None:
                 expr_txt = self.simp(self.expr(st.expr)).strip().lower()
                 if expr_txt in {"0", "0.0", "0.0d0", "0.0d+0"}:
-                    self.emit(f"allocate({array_result_name}(0))")
+                    if self.pointer_return_result_name == array_result_name:
+                        self.emit(
+                            f"if (allocated({array_result_name})) "
+                            f"deallocate({array_result_name})"
+                        )
+                    else:
+                        self.emit(f"allocate({array_result_name}(0))")
                 self.emit("return")
             elif ret_name is None:
                 self.emit("stop")
+            elif (
+                self.result_char_string
+                and isinstance(st.expr, c_ast.ID)
+                and st.expr.name == "NULL"
+            ):
+                # NULL char* result: the one-char NUL sentinel string.
+                self.emit(f"{ret_name} = achar(0)")
+                self.emit("return")
             else:
                 self.emit(f"{ret_name} = {self.expr(st.expr)}")
                 self.emit("return")
@@ -2759,6 +2999,28 @@ class Emitter:
             self.emit_for(st, ret_name=ret_name, array_result_name=array_result_name)
             return
         if isinstance(st, c_ast.While):
+            # while ((x = f(...)) OP k): C evaluates the assignment each pass.
+            # Lower to an infinite loop with the assignment re-emitted and the
+            # comparison applied to the freshly assigned variable.
+            if (
+                isinstance(st.cond, c_ast.BinaryOp)
+                and st.cond.op in ("!=", "==", "<", "<=", ">", ">=")
+                and isinstance(st.cond.left, c_ast.Assignment)
+                and st.cond.left.op == "="
+            ):
+                inner_assign = st.cond.left
+                self.emit("do")
+                self.indent += 3
+                self.emit_stmt(inner_assign)
+                saved_left = st.cond.left
+                st.cond.left = inner_assign.lvalue
+                cond_txt = self.cond_expr(st.cond)
+                st.cond.left = saved_left
+                self.emit(f"if (.not. {cond_txt}) exit")
+                self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
+                self.indent -= 3
+                self.emit("end do")
+                return
             # while (fscanf(fp, "...", &v) == 1) { ... } -> read loop with iostat
             cond = st.cond
             if (
@@ -2775,18 +3037,21 @@ class Emitter:
             ):
                 fp_expr = self.expr(cond.left.args.exprs[0])
                 read_targets = ", ".join(self.expr(a) for a in cond.left.args.exprs[2:])
-                self.emit("block")
-                self.indent += 3
-                self.emit("integer :: ios")
+                ios_name = self.fscanf_iostat_name or "ios"
+                if self.fscanf_iostat_name is None:
+                    self.emit("block")
+                    self.indent += 3
+                    self.emit(f"integer :: {ios_name}")
                 self.emit("do")
                 self.indent += 3
-                self.emit(f"read({fp_expr}, *, iostat=ios) {read_targets}")
-                self.emit("if (ios /= 0) exit")
+                self.emit(f"read({fp_expr}, *, iostat={ios_name}) {read_targets}")
+                self.emit(f"if ({ios_name} /= 0) exit")
                 self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
                 self.indent -= 3
                 self.emit("end do")
-                self.indent -= 3
-                self.emit("end block")
+                if self.fscanf_iostat_name is None:
+                    self.indent -= 3
+                    self.emit("end block")
                 return
             self.emit(f"do while ({self.cond_expr(st.cond)})")
             self.indent += 3
@@ -2921,6 +3186,16 @@ class Emitter:
                 return
             call_name = st.name.name if isinstance(st.name, c_ast.ID) else self.expr(st.name)
             call_args = self._lower_call_args(call_name, st.args.exprs if st.args else [])
+            if call_name in self.value_returning_funcs:
+                # A value-returning function invoked as a statement: Fortran
+                # functions cannot be CALLed, so discard the result explicitly.
+                self.emit("block")
+                self.indent += 3
+                self.emit("integer :: discarded_result")
+                self.emit(f"discarded_result = {self.expr(st.name)}({', '.join(call_args)})")
+                self.indent -= 3
+                self.emit("end block")
+                return
             self.emit(f"call {self.expr(st.name)}({', '.join(call_args)})")
             return
         if isinstance(st, c_ast.UnaryOp):
@@ -2977,6 +3252,78 @@ def emit_rand_helper(em: Emitter) -> None:
     em.emit("call random_number(rand_r)")
     em.emit("rand_result = int(rand_r * 2147483648.0_dp)")
     em.emit("end function rand")
+
+
+def _register_string_cursors(em: Emitter, body: c_ast.Node, locals_map: Dict[str, VarInfo]) -> None:
+    """Classify char* locals that walk through strings as integer cursors.
+
+    A cursor is a 1-based position into a base string: `const char *p = line`
+    initializes p to 1, `*p` reads `line(p:p)`, and `++p` advances it. A
+    `char *end` receiving strtof's end pointer is a cursor into the same base.
+    """
+    strings: Set[str] = set(em.char_string_names)
+    for n, info in locals_map.items():
+        if info.char_string and not info.shape:
+            strings.add(n.lower())
+
+    decl_inits: Dict[str, str] = {}
+    strtof_pairs: List[Tuple[str, str]] = []  # (pos ID, end ID)
+
+    def visit(node: c_ast.Node) -> None:
+        if isinstance(node, c_ast.Decl) and node.name and isinstance(node.init, c_ast.ID):
+            decl_inits[node.name.lower()] = node.init.name.lower()
+        if (
+            isinstance(node, c_ast.FuncCall)
+            and isinstance(node.name, c_ast.ID)
+            and node.name.name in ("strtof", "strtod", "strtol")
+            and node.args is not None
+            and len(node.args.exprs) >= 2
+        ):
+            pos_node = node.args.exprs[0]
+            end_node = node.args.exprs[1]
+            if isinstance(end_node, c_ast.UnaryOp) and end_node.op == "&":
+                end_node = end_node.expr
+            if isinstance(pos_node, c_ast.ID) and isinstance(end_node, c_ast.ID):
+                strtof_pairs.append((pos_node.name.lower(), end_node.name.lower()))
+        for _k, child in node.children():
+            if isinstance(child, c_ast.Node):
+                visit(child)
+
+    visit(body)
+
+    local_charptrs = {
+        n.lower() for n, info in locals_map.items() if info.char_string and info.alloc
+    }
+    cursors: Dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name in list(local_charptrs):
+            if name in cursors:
+                continue
+            init = decl_inits.get(name)
+            if init is not None:
+                if init in cursors:
+                    cursors[name] = cursors[init]
+                    changed = True
+                elif init in strings and init not in local_charptrs:
+                    cursors[name] = init
+                    changed = True
+                elif init in strings and init != name:
+                    # init from another char* local that stays a string
+                    cursors[name] = init
+                    changed = True
+        for pos, end in strtof_pairs:
+            if end in local_charptrs and end not in cursors and pos in cursors:
+                cursors[end] = cursors[pos]
+                changed = True
+
+    for name, base in cursors.items():
+        for key in list(locals_map.keys()):
+            if key.lower() == name:
+                locals_map[key] = VarInfo(ftype="integer")
+        em.cursor_bases[name] = base
+        em.char_string_names.discard(name)
 
 
 def _register_funcptr_arrays(em: Emitter, body: c_ast.Node, locals_map: Dict[str, VarInfo]) -> None:
@@ -3127,6 +3474,117 @@ def _register_pointer_section_aliases(
     visit(body)
 
 
+def emit_fgetc_helper(em: Emitter) -> None:
+    """Emit c2f_fgetc(unit): one byte like C fgetc (10 at EOL, -1 at EOF)."""
+    em.emit("function c2f_fgetc(unit) result(ch)")
+    em.emit("! read one character code like C fgetc; 10 at end of line, -1 at end of file")
+    em.emit("use, intrinsic :: iso_fortran_env, only: iostat_eor")
+    em.emit("integer, intent(in) :: unit")
+    em.emit("integer :: ch, ios")
+    em.emit("character(len=1) :: c")
+    em.emit("read(unit, '(a1)', advance=\"no\", iostat=ios) c")
+    em.emit("if (ios == iostat_eor) then")
+    em.emit("   ch = 10")
+    em.emit("else if (ios /= 0) then")
+    em.emit("   ch = -1")
+    em.emit("else")
+    em.emit("   ch = ichar(c)")
+    em.emit("end if")
+    em.emit("end function c2f_fgetc")
+
+
+def emit_isspace_helper(em: Emitter) -> None:
+    """Emit c2f_isspace(ic): C isspace over a character code."""
+    em.emit("function c2f_isspace(ic) result(r)")
+    em.emit("! C isspace: blank and control whitespace character codes")
+    em.emit("integer, intent(in) :: ic")
+    em.emit("integer :: r")
+    em.emit("r = 0")
+    em.emit("if (ic == 32 .or. (ic >= 9 .and. ic <= 13)) r = 1")
+    em.emit("end function c2f_isspace")
+
+
+def emit_strtof_helper(em: Emitter) -> None:
+    """Emit c2f_strtof(s, pos, endpos): parse a real like C strtof."""
+    em.emit("function c2f_strtof(s, pos, endpos) result(v)")
+    em.emit("! parse a real starting at s(pos:); endpos is one past the number, or pos on failure")
+    em.emit("character(len=*), intent(in) :: s")
+    em.emit("integer, intent(in) :: pos")
+    em.emit("integer, intent(out) :: endpos")
+    em.emit("real(kind=sp) :: v")
+    em.emit("integer :: i, j, ios")
+    em.emit("v = 0.0")
+    em.emit("i = pos")
+    em.emit("do while (i <= len(s))")
+    em.emit("   if (s(i:i) /= ' ' .and. ichar(s(i:i)) /= 9) exit")
+    em.emit("   i = i + 1")
+    em.emit("end do")
+    em.emit("j = i")
+    em.emit("do while (j <= len(s))")
+    em.emit("   if (index('0123456789+-.eE', s(j:j)) == 0) exit")
+    em.emit("   j = j + 1")
+    em.emit("end do")
+    em.emit("endpos = pos")
+    em.emit("if (j > i) then")
+    em.emit("   read(s(i:j-1), *, iostat=ios) v")
+    em.emit("   if (ios == 0) endpos = j")
+    em.emit("end if")
+    em.emit("end function c2f_strtof")
+
+
+def emit_setchar_helper(em: Emitter) -> None:
+    """Emit c2f_setchar(s, i, c): store one character, growing s as needed."""
+    em.emit("subroutine c2f_setchar(s, i, c)")
+    em.emit("! store character c at position i, growing s when needed")
+    em.emit("character(len=:), allocatable, intent(inout) :: s")
+    em.emit("integer, intent(in) :: i")
+    em.emit("character(len=1), intent(in) :: c")
+    em.emit('if (.not. allocated(s)) s = ""')
+    em.emit("do while (len(s) < i)")
+    em.emit('   s = s // " "')
+    em.emit("end do")
+    em.emit("s(i:i) = c")
+    em.emit("end subroutine c2f_setchar")
+
+
+def _uses_setchar(ast_root: c_ast.FileAST) -> bool:
+    """True when any function stores a non-NUL char into a C string."""
+    for e in ast_root.ext:
+        if not isinstance(e, c_ast.FuncDef):
+            continue
+        string_names: Set[str] = set()
+        lm: Dict[str, VarInfo] = {}
+        gather_decls(e.body, lm)
+        for n, info in lm.items():
+            if info.char_string and not info.shape:
+                string_names.add(n.lower())
+        fdecl = e.decl.type
+        if isinstance(fdecl, c_ast.FuncDecl) and fdecl.args is not None:
+            for p in fdecl.args.params:
+                if isinstance(p, c_ast.Decl) and p.name and _classify_char_decl(p.type) == "scalar":
+                    string_names.add(p.name.lower())
+        found = [False]
+
+        def visit(node: c_ast.Node) -> None:
+            if (
+                isinstance(node, c_ast.Assignment)
+                and node.op == "="
+                and isinstance(node.lvalue, c_ast.ArrayRef)
+                and isinstance(node.lvalue.name, c_ast.ID)
+                and node.lvalue.name.name.lower() in string_names
+                and not Emitter._is_nul_char_constant(node.rvalue)
+            ):
+                found[0] = True
+            for _k, child in node.children():
+                if isinstance(child, c_ast.Node):
+                    visit(child)
+
+        visit(e.body)
+        if found[0]:
+            return True
+    return False
+
+
 def emit_argv_helper(em: Emitter) -> None:
     """Emit argv_value(pos): the pos-th command-line argument as a string."""
     em.emit("function argv_value(pos) result(argv_value_result)")
@@ -3193,6 +3651,7 @@ def emit_function(
         params = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)]
     need_ieee_consts = ast_uses_any_id(fn.body, {"NAN", "INFINITY", "HUGE_VAL"})
     need_ieee_finite = bool(collect_called_names(fn.body, {"isfinite"}))
+    need_fscanf_status = bool(collect_called_names(fn.body, {"fscanf"}))
     ieee_imports: List[str] = []
     if need_ieee_consts:
         ieee_imports.extend(["ieee_value", "ieee_quiet_nan", "ieee_positive_inf"])
@@ -3217,10 +3676,17 @@ def emit_function(
 
         locals_map: Dict[str, VarInfo] = {}
         gather_decls(fn.body, locals_map)
+        if need_fscanf_status:
+            ios_name = "c2f_iostat"
+            while ios_name in locals_map:
+                ios_name += "_"
+            locals_map[ios_name] = VarInfo(ftype="integer")
+            em.fscanf_iostat_name = ios_name
         _register_realloc_aliases(em, fn.body, locals_map)
         _register_pointer_section_aliases(em, fn.body, locals_map)
         _demote_nonarray_pointer_locals(em, fn.body, locals_map)
         _register_funcptr_arrays(em, fn.body, locals_map)
+        _register_string_cursors(em, fn.body, locals_map)
         # C main(argc, argv): argc maps onto command_argument_count()+1 (the
         # command name is argument 0 in both models) and argv[i] onto the
         # argv_value() helper.
@@ -3260,22 +3726,46 @@ def emit_function(
         em.argv_name = None
         em.alias_map = {}
         em.funcptr_arrays = {}
+        em.cursor_bases = {}
+        em.result_char_string = False
         em.struct_ptr_names.clear()
         em.var_infos = {}
+        em.fscanf_iostat_name = None
         return
 
     # non-main -> Fortran function
-    ret_ftype, _ = c_to_ftype(fdecl.type)
+    ret_ftype, ret_alloc = c_to_ftype(fdecl.type)
+    ret_struct_match = re.match(r"^type\(([^)]+)\)$", ret_ftype, re.IGNORECASE)
+    returns_allocatable_array = bool(
+        ret_alloc
+        and not ret_ftype.lower().startswith("character")
+        and not (
+            ret_struct_match is not None
+            and ret_struct_match.group(1).lower() in _STRUCT_RECURSIVE
+        )
+    )
     out_idx = em.array_result_funcs.get(name, None)
     out_param_name: Optional[str] = None
     out_c_param_name: Optional[str] = None
+    # C by-value scalar params reassigned in the body are local copies, not
+    # outputs: pass them as `<name>_arg` (intent(in)) and copy into a local.
+    copy_in_params: Dict[str, str] = {}
+    for p in params:
+        if not p.name or type_is_ptr_or_array(p.type) or _is_funcptr_param(p):
+            continue
+        p_ft_probe, _ = c_to_ftype(p.type)
+        if p_ft_probe.lower().startswith("character"):
+            continue
+        _has_r, has_w = _scan_dummy_usage(fn.body, p.name)
+        if has_w:
+            copy_in_params[p.name] = f"{p.name}_arg"
     pnames: List[str] = []
     for idx, p in enumerate(params):
         if out_idx is not None and idx == out_idx:
             out_c_param_name = p.name
             out_param_name = p.name
             continue
-        pnames.append(p.name)
+        pnames.append(copy_in_params.get(p.name, p.name))
 
     result_name_for_body: Optional[str] = None
     result_decl_ftype: Optional[str] = None
@@ -3295,6 +3785,7 @@ def emit_function(
         if ret_ftype.lower().startswith("character"):
             # A char*-returning C function yields an exact-length string.
             result_decl_ftype = "character(len=:), allocatable"
+            em.result_char_string = True
     em.emit(f"! {proc_docline(name, unit_kind)}")
     if c_header_comment:
         em.lines[-1] = f"! {c_header_comment}"
@@ -3366,7 +3857,7 @@ def emit_function(
     for idx, p in enumerate(params):
         if out_idx is not None and idx == out_idx:
             continue
-        if isinstance(p.type, c_ast.PtrDecl) and isinstance(p.type.type, c_ast.FuncDecl):
+        if _is_funcptr_param(p):
             iface = em.func_ptr_ifaces.get((name, idx))
             if iface is not None:
                 # C function-pointer parameter: a dummy procedure with the
@@ -3381,6 +3872,16 @@ def emit_function(
                 # lets a TARGET actual associate the pointer on entry (F2008).
                 em.emit(f"{pf_ptr}, pointer, intent(in) :: {p.name}")
                 em.struct_ptr_names.add(p.name.lower())
+                continue
+            if (
+                isinstance(p.type.type, c_ast.PtrDecl)
+                and not pf_ptr.lower().startswith("character")
+                and pf_ptr != "void"
+                and _deref_stores_array(fn.body, p.name, _fn_locals)
+            ):
+                # T** out-parameter receiving a whole array (*param = buf):
+                # an allocatable array the callee assigns.
+                em.emit(f"{pf_ptr}, allocatable, intent(out) :: {p.name}(:)")
                 continue
         p_ft, p_alloc = c_to_ftype(p.type)
         p_ptr_or_arr = type_is_ptr_or_array(p.type)
@@ -3424,21 +3925,34 @@ def emit_function(
             em.emit(add_inline_comment(f"{p_ft}, {intent} :: {p.name}({dims})", inline_doc))
             if rank == 1:
                 em.pointer_like_names.add(p.name.lower())
+        elif p.name in copy_in_params:
+            em.emit(add_inline_comment(f"{p_ft}, intent(in) :: {copy_in_params[p.name]}", inline_doc))
         else:
             em.emit(add_inline_comment(f"{p_ft}, {intent} :: {p.name}", inline_doc))
     if out_idx is not None and out_param_name is not None:
         em.emit(add_inline_comment(f"integer, allocatable :: {out_param_name}(:)", arg_docline(out_param_name, "integer")))
         em.array_result_name = out_param_name
     elif unit_kind == "function" and result_name_for_body is not None and result_decl_ftype is not None:
-        em.emit(f"{result_decl_ftype} :: {result_name_for_body}")
+        if returns_allocatable_array:
+            em.emit(f"{result_decl_ftype}, allocatable :: {result_name_for_body}(:)")
+        else:
+            em.emit(f"{result_decl_ftype} :: {result_name_for_body}")
 
     # locals
     locals_map: Dict[str, VarInfo] = {}
     gather_decls(fn.body, locals_map)
+    if need_fscanf_status:
+        ios_name = "c2f_iostat"
+        reserved_names = set(locals_map) | set(pnames)
+        while ios_name in reserved_names:
+            ios_name += "_"
+        locals_map[ios_name] = VarInfo(ftype="integer")
+        em.fscanf_iostat_name = ios_name
     _register_realloc_aliases(em, fn.body, locals_map)
     _register_pointer_section_aliases(em, fn.body, locals_map)
     _demote_nonarray_pointer_locals(em, fn.body, locals_map)
     _register_funcptr_arrays(em, fn.body, locals_map)
+    _register_string_cursors(em, fn.body, locals_map)
     em.var_infos = {k.lower(): v for k, v in locals_map.items()}
     for n, info in locals_map.items():
         if info.struct_ptr:
@@ -3450,6 +3964,37 @@ def emit_function(
             continue
         if info.alloc:
             em.pointer_like_names.add(n.lower())
+    if returns_allocatable_array and result_name_for_body is not None:
+        em.var_infos[result_name_for_body.lower()] = VarInfo(
+            ftype=result_decl_ftype or ret_ftype,
+            alloc=True,
+        )
+        returned_names: Set[str] = set()
+
+        def _collect_returned_names(node: c_ast.Node) -> None:
+            if isinstance(node, c_ast.Return) and node.expr is not None:
+                expr = node.expr
+                while isinstance(expr, c_ast.Cast):
+                    expr = expr.expr
+                if isinstance(expr, c_ast.ID) and expr.name != "NULL":
+                    returned_names.add(expr.name)
+            for _key, child in node.children():
+                if isinstance(child, c_ast.Node):
+                    _collect_returned_names(child)
+
+        _collect_returned_names(fn.body)
+        if len(returned_names) == 1:
+            returned_name = next(iter(returned_names))
+            returned_info = locals_map.get(returned_name)
+            if returned_info is not None and returned_info.alloc:
+                em.array_result_name = result_name_for_body
+                em.array_result_tmp_alias = returned_name
+                em.alias_map[returned_name.lower()] = result_name_for_body
+                for alias, target in list(em.alias_map.items()):
+                    if target.lower() == returned_name.lower():
+                        em.alias_map[alias] = result_name_for_body
+                locals_map.pop(returned_name, None)
+        em.pointer_return_result_name = result_name_for_body
     if out_idx is not None and out_param_name is not None:
         # If function body includes `*out = tmp` and tmp is allocatable local,
         # alias tmp -> out and avoid declaring tmp.
@@ -3468,13 +4013,27 @@ def emit_function(
                             break
     if em.funcptr_arrays:
         emit_funcptr_wrapper_type(em)
+    for cn, _arg in copy_in_params.items():
+        if cn not in locals_map:
+            cn_ft = "integer"
+            for p in params:
+                if p.name == cn:
+                    cn_ft, _ = c_to_ftype(p.type)
+            locals_map[cn] = VarInfo(ftype=cn_ft)
+            em.var_infos[cn.lower()] = locals_map[cn]
     em.emit_decl_grouped(locals_map, params=param_set, ret_name=result_name_for_body if unit_kind == "function" else None)
+    for cn, arg in copy_in_params.items():
+        em.emit(f"{cn} = {arg}")
 
     # body
     em.emit_stmt(
         fn.body,
         ret_name=result_name_for_body if unit_kind == "function" else None,
-        array_result_name=out_param_name if out_idx is not None else None,
+        array_result_name=(
+            out_param_name
+            if out_idx is not None
+            else result_name_for_body if returns_allocatable_array else None
+        ),
     )
     if unit_kind == "subroutine":
         em.emit(f"end subroutine {name}")
@@ -3482,11 +4041,15 @@ def emit_function(
         em.emit(f"end function {name}")
     em.array_result_name = None
     em.array_result_tmp_alias = None
+    em.pointer_return_result_name = None
+    em.fscanf_iostat_name = None
     em.pointer_like_names.clear()
     em.char_string_names.clear()
     em.id_rename = {}
     em.alias_map = {}
     em.funcptr_arrays = {}
+    em.cursor_bases = {}
+    em.result_char_string = False
     em.struct_ptr_names.clear()
     em.var_infos = {}
 
@@ -3752,6 +4315,14 @@ def transpile_c_to_fortran(
         rename_ast_identifiers(ast, keyword_renames)
     real_prec = _detect_c_real_precision(src)
     dp_init = "kind(1.0)" if real_prec == "single" else "kind(1.0d0)"
+    _FUNCPTR_TYPEDEFS.clear()
+    for ext in ast.ext:
+        if (
+            isinstance(ext, c_ast.Typedef)
+            and isinstance(ext.type, c_ast.PtrDecl)
+            and isinstance(ext.type.type, c_ast.FuncDecl)
+        ):
+            _FUNCPTR_TYPEDEFS.add(ext.name)
     struct_defs = collect_struct_typedefs(ast)
     enum_constants = collect_enum_constants(ast)
     define_constants = collect_define_constants(text)
@@ -3892,6 +4463,16 @@ def transpile_c_to_fortran(
         ]
     qsort_kinds = _collect_qsort_elem_kinds(ast)
     retained_units = funcs + mains
+    # C library shims emitted into the module when the C source calls them.
+    cstd_helper_names: List[str] = []
+    if any(collect_called_names(u.body, {"fgetc"}) for u in retained_units):
+        cstd_helper_names.append("c2f_fgetc")
+    if any(collect_called_names(u.body, {"isspace"}) for u in retained_units):
+        cstd_helper_names.append("c2f_isspace")
+    if any(collect_called_names(u.body, {"strtof", "strtod"}) for u in retained_units):
+        cstd_helper_names.append("c2f_strtof")
+    if _uses_setchar(ast):
+        cstd_helper_names.append("c2f_setchar")
     uses_rand = any(collect_called_names(unit.body, {"rand"}) for unit in retained_units)
     main_uses_rand = any(collect_called_names(m, {"rand"}) for m in mains)
     uses_argv = False
@@ -3913,10 +4494,7 @@ def transpile_c_to_fortran(
     for e in funcs + mains:
         fd = e.decl.type
         fps = [p for p in (fd.args.params if fd.args else []) if isinstance(p, c_ast.Decl)]
-        fp_idxs = [
-            i for i, p in enumerate(fps)
-            if isinstance(p.type, c_ast.PtrDecl) and isinstance(p.type.type, c_ast.FuncDecl)
-        ]
+        fp_idxs = [i for i, p in enumerate(fps) if _is_funcptr_param(p)]
         if fp_idxs:
             func_ptr_param_idx[e.decl.name] = fp_idxs
     if func_ptr_param_idx:
@@ -3936,6 +4514,13 @@ def transpile_c_to_fortran(
                 if isinstance(child, c_ast.Node):
                     _scan_fp_calls(child)
         _scan_fp_calls(ast)
+
+    for e in funcs:
+        efdecl = e.decl.type
+        if isinstance(efdecl, c_ast.FuncDecl):
+            e_ret, _ = c_to_ftype(efdecl.type)
+            if e_ret != "void" and e.decl.name not in array_result_funcs:
+                em.value_returning_funcs.add(e.decl.name)
 
     main_called_module_names: Set[str] = set()
     main_needed_types: Set[str] = set()
@@ -4004,7 +4589,7 @@ def transpile_c_to_fortran(
 
     # Emit a module whenever there are module procedures, a rand()/argv
     # helper, struct type definitions, or shared global variables.
-    if funcs or uses_rand or uses_argv or struct_defs or global_vars or qsort_kinds:
+    if funcs or uses_rand or uses_argv or struct_defs or global_vars or qsort_kinds or cstd_helper_names:
         em.emit("module xc2f_mod")
         em.emit("implicit none")
         em.emit("private")
@@ -4053,7 +4638,7 @@ def transpile_c_to_fortran(
                     decl += f" = {ginit}"
                 em.emit(decl)
             em.emit("")
-        if funcs or uses_rand or uses_argv or qsort_kinds:
+        if funcs or uses_rand or uses_argv or qsort_kinds or cstd_helper_names:
             em.emit("contains")
             em.emit("")
             for ext in funcs:
@@ -4072,6 +4657,14 @@ def transpile_c_to_fortran(
                 em.emit("")
             for k in sorted(qsort_kinds):
                 emit_qsort_helper(em, k)
+                em.emit("")
+            for helper in cstd_helper_names:
+                {
+                    "c2f_fgetc": emit_fgetc_helper,
+                    "c2f_isspace": emit_isspace_helper,
+                    "c2f_strtof": emit_strtof_helper,
+                    "c2f_setchar": emit_setchar_helper,
+                }[helper](em)
                 em.emit("")
         em.emit("end module xc2f_mod")
         em.emit("")
@@ -4175,6 +4768,11 @@ def transpile_c_to_fortran(
     out_text = "".join(fpost.ensure_blank_line_between_module_procedures(out_text.splitlines(keepends=True)))
     out_text = "".join(fpost.ensure_blank_line_between_program_units(out_text.splitlines(keepends=True)))
     out_text = "".join(fscan.ensure_space_before_inline_comments(out_text.splitlines(keepends=True)))
+    out_text = "".join(
+        fpost.combine_blank_write_with_following_character_write(
+            out_text.splitlines(keepends=True)
+        )
+    )
     out_text = "".join(
         fpost.remove_parentheses_around_variable_references(
             out_text.splitlines(keepends=True)
@@ -5031,6 +5629,11 @@ def add_pure_when_possible(lines: List[str]) -> List[str]:
         changed = False
         for proc in result.candidates:
             idx = proc.start - 1
+            # A dummy procedure's purity comes from its interface function; the
+            # generated interfaces are not marked PURE, so a caller taking a
+            # procedure dummy cannot be PURE itself.
+            if _unit_has_procedure_dummy(updated, idx):
+                continue
             changed = (
                 xpure.apply_decl_edit_at_or_continuation(
                     updated, idx, xpure.add_pure_to_declaration
@@ -5040,6 +5643,20 @@ def add_pure_when_possible(lines: List[str]) -> List[str]:
         if not changed:
             break
     return updated
+
+
+def _unit_has_procedure_dummy(lines: List[str], start_idx: int) -> bool:
+    """True when the unit starting at start_idx declares a procedure dummy."""
+    end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+    i = start_idx + 1
+    while i < len(lines):
+        code = fscan.strip_comment(lines[i]).strip()
+        if end_re.match(code):
+            break
+        if re.match(r"^\s*procedure\s*\(", code, re.IGNORECASE):
+            return True
+        i += 1
+    return False
 
 
 def inline_single_use_temp_assignments(lines: List[str]) -> List[str]:
@@ -5306,6 +5923,9 @@ def main() -> int:
             post_lines_loc = _remove_arg_style_doc_comments(post_lines_loc)
             fsrc_loc = _normalize_kind_intrinsic_literals("".join(post_lines_loc))
         final_lines_loc = fsrc_loc.splitlines(keepends=True)
+        final_lines_loc = fpost.combine_blank_write_with_following_character_write(
+            final_lines_loc
+        )
         final_lines_loc = fpost.remove_parentheses_around_variable_references(
             final_lines_loc
         )

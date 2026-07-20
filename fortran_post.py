@@ -137,6 +137,52 @@ def collapse_consecutive_blank_lines(lines: List[str]) -> List[str]:
     return out
 
 
+def combine_blank_write_with_following_character_write(lines: List[str]) -> List[str]:
+    """Combine a blank stdout record and following character write.
+
+    For example, two advancing writes using ``(a)`` become one write using
+    ``(/,a)``.  Only adjacent statements at identical indentation are merged.
+    """
+    blank_re = re.compile(
+        r'^(?P<indent>\s*)write\s*\(\s*\*\s*,\s*["\']\(a\)["\']\s*\)\s*["\']["\']\s*$',
+        re.IGNORECASE,
+    )
+    text_re = re.compile(
+        r'^(?P<indent>\s*)write\s*\(\s*\*\s*,\s*["\']\(a\)["\']\s*\)\s*'
+        r'(?P<literal>"(?:""|[^"])*"|\'(?:\'\'|[^\'])*\')\s*$',
+        re.IGNORECASE,
+    )
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        first_code, first_comment = xunused.split_code_comment(
+            lines[i].rstrip("\r\n")
+        )
+        first_match = blank_re.match(first_code)
+        if first_match is not None and not first_comment and i + 1 < len(lines):
+            second_code, second_comment = xunused.split_code_comment(
+                lines[i + 1].rstrip("\r\n")
+            )
+            second_match = text_re.match(second_code)
+            if (
+                second_match is not None
+                and not second_comment
+                and second_match.group("indent") == first_match.group("indent")
+            ):
+                eol = xunused.get_eol(lines[i + 1]) or (
+                    "\n" if lines[i + 1].endswith("\n") else ""
+                )
+                out.append(
+                    f'{first_match.group("indent")}write(*,"(/,a)") '
+                    f'{second_match.group("literal")}{eol}'
+                )
+                i += 2
+                continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
 def remove_parentheses_around_variable_references(lines: List[str]) -> List[str]:
     """Remove grouping parentheses around scalar names and component chains.
 
@@ -1837,6 +1883,30 @@ def _rewrite_call_drop_arg(code: str, fname: str, n_idx: int) -> str:
     return "".join(out)
 
 
+def _array_subscript_contains_star(code: str, arr: str) -> bool:
+    """True when any `arr(...)` use in code multiplies inside the subscript.
+
+    Handles nested parentheses (e.g. `arr(((int(i) * ndim)) + 1:)`), which a
+    flat regex cannot cross.
+    """
+    use_re = re.compile(rf"\b{re.escape(arr)}\s*\(", re.IGNORECASE)
+    for m in use_re.finditer(code):
+        depth = 0
+        j = m.end() - 1
+        while j < len(code):
+            ch = code[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif ch == "*" and depth >= 1:
+                return True
+            j += 1
+    return False
+
+
 def remove_redundant_size_dummy_args(lines: List[str]) -> List[str]:
     """Remove redundant integer size dummies for assumed-shape args.
 
@@ -1940,11 +2010,14 @@ def remove_redundant_size_dummy_args(lines: List[str]) -> List[str]:
             subscript_re = re.compile(
                 rf"[a-z_]\w*\s*\([^)]*\b{re.escape(nlow)}\b", re.IGNORECASE
             )
+            # A subscript containing a product (arr(i * ndim + ...)) marks a
+            # flattened multi-dimensional array whose extent is a product of
+            # sizes, not this dummy alone; size(arr) would be wrong.
             for k in range(i + 1, j):
                 c = fscan.strip_comment(out[k])
                 if "::" in c:
                     continue
-                if subscript_re.search(c):
+                if subscript_re.search(c) or _array_subscript_contains_star(c, arr):
                     bad = True
                     break
             if bad:
