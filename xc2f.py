@@ -4876,7 +4876,15 @@ def transpile_c_to_fortran(
         fscan.simplify_integer_arithmetic_in_lines(out_text.splitlines(keepends=True))
     )
     out_text = "".join(
+        fpost.simplify_logical_identities(out_text.splitlines(keepends=True))
+    )
+    out_text = "".join(
         fpost.remove_parentheses_around_variable_references(
+            out_text.splitlines(keepends=True)
+        )
+    )
+    out_text = "".join(
+        fpost.space_compound_parenthesized_offsets(
             out_text.splitlines(keepends=True)
         )
     )
@@ -6079,12 +6087,14 @@ def main() -> int:
             fsrc_loc = _normalize_kind_intrinsic_literals("".join(post_lines_loc))
         final_lines_loc = fsrc_loc.splitlines(keepends=True)
         final_lines_loc = fscan.simplify_integer_arithmetic_in_lines(final_lines_loc)
+        final_lines_loc = fpost.simplify_logical_identities(final_lines_loc)
         final_lines_loc = fpost.combine_blank_write_with_following_character_write(
             final_lines_loc
         )
         final_lines_loc = fpost.remove_parentheses_around_variable_references(
             final_lines_loc
         )
+        final_lines_loc = fpost.space_compound_parenthesized_offsets(final_lines_loc)
         final_lines_loc = fpost.collapse_consecutive_blank_lines(final_lines_loc)
         fsrc_loc = "".join(final_lines_loc)
         return fsrc_loc

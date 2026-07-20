@@ -32,6 +32,186 @@ def simplify_do_while_true(lines: List[str]) -> List[str]:
     return out
 
 
+def simplify_logical_identities(lines: List[str]) -> List[str]:
+    """Remove neutral logical literals without changing expression evaluation.
+
+    Simplifies ``.false. .or. x`` and ``.true. .and. x`` (in either order),
+    including when they occur inside nested parentheses.  An all-neutral OR
+    or AND chain is retained as its corresponding logical literal.
+    """
+
+    def _matching_outer_parens(text: str) -> bool:
+        if not (text.startswith("(") and text.endswith(")")):
+            return False
+        depth = 0
+        quote = ""
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    if i + 1 < len(text) and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = ""
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(text) - 1:
+                    return False
+            i += 1
+        return depth == 0 and not quote
+
+    def _logical_literal(text: str) -> str:
+        core = text.strip()
+        while _matching_outer_parens(core):
+            core = core[1:-1].strip()
+        low = core.lower()
+        return low if low in {".true.", ".false."} else ""
+
+    def _split_top_level(text: str, operator: str) -> List[str]:
+        parts: List[str] = []
+        start = 0
+        depth = 0
+        quote = ""
+        low = text.lower()
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    if i + 1 < len(text) and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = ""
+                i += 1
+                continue
+            if ch in "'\"":
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and low.startswith(operator, i):
+                parts.append(text[start:i])
+                i += len(operator)
+                start = i
+                continue
+            i += 1
+        if not parts:
+            return [text]
+        parts.append(text[start:])
+        return parts
+
+    def _simplify_level(text: str) -> str:
+        or_terms = _split_top_level(text, ".or.")
+        if len(or_terms) > 1:
+            terms = [_simplify_and(term) for term in or_terms]
+            kept = [term.strip() for term in terms if _logical_literal(term) != ".false."]
+            return " .or. ".join(kept) if kept else ".false."
+        return _simplify_and(text)
+
+    def _simplify_and(text: str) -> str:
+        and_terms = _split_top_level(text, ".and.")
+        if len(and_terms) == 1:
+            return text
+        kept = [
+            term.strip()
+            for term in and_terms
+            if _logical_literal(term) != ".true."
+        ]
+        return " .and. ".join(kept) if kept else ".true."
+
+    def _simplify_statement_level(text: str) -> str:
+        """Apply identities to an assignment RHS or to a bare expression."""
+        depth = 0
+        quote = ""
+        for i, ch in enumerate(text):
+            if quote:
+                if ch == quote:
+                    quote = ""
+                continue
+            if ch in "'\"":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "=" and depth == 0:
+                previous = text[i - 1] if i else ""
+                following = text[i + 1] if i + 1 < len(text) else ""
+                if previous not in "<>=/" and following not in "=>":
+                    rhs = text[i + 1 :]
+                    leading = rhs[: len(rhs) - len(rhs.lstrip())]
+                    return f"{text[:i + 1]}{leading}{_simplify_level(rhs).lstrip()}"
+        return _simplify_level(text)
+
+    def _rewrite_expr(text: str) -> str:
+        out: List[str] = []
+        i = 0
+        while i < len(text):
+            if text[i] in "'\"":
+                quote = text[i]
+                start = i
+                i += 1
+                while i < len(text):
+                    if text[i] != quote:
+                        i += 1
+                        continue
+                    if i + 1 < len(text) and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                out.append(text[start:i])
+                continue
+            if text[i] != "(":
+                out.append(text[i])
+                i += 1
+                continue
+            depth = 1
+            quote = ""
+            close = i + 1
+            while close < len(text) and depth:
+                ch = text[close]
+                if quote:
+                    if ch == quote:
+                        if close + 1 < len(text) and text[close + 1] == quote:
+                            close += 2
+                            continue
+                        quote = ""
+                elif ch in "'\"":
+                    quote = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                close += 1
+            if depth:
+                out.append(text[i:])
+                break
+            inner = _rewrite_expr(text[i + 1 : close - 1])
+            out.append(f"({_simplify_level(inner)})")
+            i = close
+        return _simplify_statement_level("".join(out))
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_rewrite_expr(code)}{comment}{eol}")
+    return out
+
+
 def collapse_single_stmt_if_blocks(lines: List[str]) -> List[str]:
     """Collapse 3-line IF blocks with one executable body statement.
 
@@ -578,6 +758,84 @@ def normalize_delimiter_inner_spacing(lines: List[str]) -> List[str]:
             cleaned.append(ch)
             i += 1
         out.append("".join(cleaned) + comment + eol)
+    return out
+
+
+def space_compound_parenthesized_offsets(lines: List[str]) -> List[str]:
+    """Space integer offsets following a parenthesized compound expression.
+
+    Simple one-based indices such as ``i+1`` remain compact, while expressions
+    such as ``((i * n) + i)+1`` become ``((i * n) + i) + 1``.
+    """
+    offset_re = re.compile(r"\)\s*([+\-])\s*(\d+)(?![\w.])")
+
+    def _has_top_level_binary_operator(expr: str) -> bool:
+        depth = 0
+        for i, ch in enumerate(expr):
+            if ch == "(":
+                depth += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                continue
+            if depth != 0 or ch not in "+-*/":
+                continue
+            left = expr[:i].rstrip()
+            right = expr[i + 1 :].lstrip()
+            if left and right and not (ch in "+-" and left[-1] in "+-*/("):
+                return True
+        return False
+
+    def _rewrite_segment(segment: str) -> str:
+        stack: List[int] = []
+        opening_for_close: dict[int, int] = {}
+        for i, ch in enumerate(segment):
+            if ch == "(":
+                stack.append(i)
+            elif ch == ")" and stack:
+                opening_for_close[i] = stack.pop()
+
+        def _replace(match: re.Match[str]) -> str:
+            opening = opening_for_close.get(match.start())
+            if opening is None:
+                return match.group(0)
+            if not _has_top_level_binary_operator(segment[opening + 1 : match.start()]):
+                return match.group(0)
+            return f") {match.group(1)} {match.group(2)}"
+
+        return offset_re.sub(_replace, segment)
+
+    def _rewrite_outside_strings(code: str) -> str:
+        parts: List[str] = []
+        start = 0
+        i = 0
+        while i < len(code):
+            quote = code[i]
+            if quote not in "'\"":
+                i += 1
+                continue
+            parts.append(_rewrite_segment(code[start:i]))
+            literal_start = i
+            i += 1
+            while i < len(code):
+                if code[i] != quote:
+                    i += 1
+                    continue
+                if i + 1 < len(code) and code[i + 1] == quote:
+                    i += 2
+                    continue
+                i += 1
+                break
+            parts.append(code[literal_start:i])
+            start = i
+        parts.append(_rewrite_segment(code[start:]))
+        return "".join(parts)
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_rewrite_outside_strings(code)}{comment}{eol}")
     return out
 
 
