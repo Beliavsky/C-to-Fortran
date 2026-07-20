@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ast
 import difflib
+import glob
 import re
 import subprocess
 import sys
@@ -1219,6 +1220,7 @@ class Emitter:
         self.define_constants: Dict[str, Tuple[str, str]] = define_constants or {}
         self.generic_macros: Dict[str, Dict[str, str]] = generic_macros or {}
         self.array_param_funcs: Dict[str, Set[int]] = {}
+        self.func_param_ftypes: Dict[str, List[Optional[str]]] = {}
         # Function name -> dummy indices written either directly or through a
         # chain of calls. Used to propagate Fortran INTENT requirements.
         self.writable_param_funcs: Dict[str, Set[int]] = {}
@@ -1256,6 +1258,8 @@ class Emitter:
         self.fscanf_iostat_name: Optional[str] = None
         self.auto_alloc_assigned: Set[str] = set()
         self.pointer_like_names: Set[str] = set()
+        self.nonnullable_pointer_names: Set[str] = set()
+        self.procedure_dummy_renames: Dict[str, str] = {}
         self.var_infos: Dict[str, VarInfo] = {}
         self.label_map: Dict[str, int] = {}
 
@@ -1299,6 +1303,24 @@ class Emitter:
             return self.simp(self.expr(n))
         return self.simp(f"({self.expr(n)} /= 0)")
 
+    @classmethod
+    def _integer_constant_text(cls, node: c_ast.Node) -> Optional[str]:
+        """Return normalized text for a possibly signed integer constant."""
+        sign = ""
+        value_node = node
+        if isinstance(node, c_ast.UnaryOp) and node.op in ("+", "-"):
+            sign = node.op
+            value_node = node.expr
+        if not (
+            isinstance(value_node, c_ast.Constant)
+            and value_node.type == "int"
+        ):
+            return None
+        normalized = cls._normalize_int_literal(value_node.value)
+        if normalized is None:
+            return None
+        return f"{sign}{normalized}"
+
     @staticmethod
     def _normalize_int_literal(txt: str) -> Optional[str]:
         """Convert a C integer literal (hex/octal + u/l suffixes) to decimal."""
@@ -1331,13 +1353,15 @@ class Emitter:
             return f"achar({code})"
         return '"' + value.replace('"', '""') + '"'
 
-    def _init_elem_expr(self, node: c_ast.Node, real_target: bool) -> str:
+    def _init_elem_expr(
+        self, node: c_ast.Node, real_target: bool, real_kind: str = "dp"
+    ) -> str:
         """Expr for an array initializer element, promoting ints to reals when
         the array element type is real (Fortran array constructors are typed)."""
-        if real_target and isinstance(node, c_ast.Constant) and node.type == "int":
-            norm = self._normalize_int_literal(node.value)
+        if real_target:
+            norm = self._integer_constant_text(node)
             if norm is not None:
-                return f"{norm}.0_dp"
+                return f"{norm}.0_{real_kind}"
         return self.expr(node)
 
     @staticmethod
@@ -1384,6 +1408,7 @@ class Emitter:
         """Lower call arguments, turning `&arr[i]` into an array section when the
         callee's corresponding parameter is an array (C array decay)."""
         arr_idxs = self.array_param_funcs.get(fname, set())
+        formal_types = self.func_param_ftypes.get(fname, [])
         out: List[str] = []
         for idx, a in enumerate(arg_nodes):
             if idx in arr_idxs and isinstance(a, c_ast.UnaryOp) and a.op == "&" and isinstance(a.expr, c_ast.ArrayRef):
@@ -1391,7 +1416,15 @@ class Emitter:
                 off = self.expr(a.expr.subscript)
                 out.append(base if off.strip() in ("0", "+0") else f"{base}(({off})+1:)")
             else:
-                out.append(self.expr(a))
+                formal_type = formal_types[idx] if idx < len(formal_types) else None
+                if formal_type is not None and formal_type.lower().startswith("real"):
+                    kind_match = re.search(
+                        r"kind\s*=\s*([a-z_]\w*)", formal_type, re.IGNORECASE
+                    )
+                    kind_name = kind_match.group(1) if kind_match else "dp"
+                    out.append(self._init_elem_expr(a, True, kind_name))
+                else:
+                    out.append(self.expr(a))
         return out
 
     def _rename_ids_in_text(self, txt: str) -> str:
@@ -1475,6 +1508,9 @@ class Emitter:
             txt = re.sub(r"(?i)^([+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[e][+-]?\d+)?)f$", r"\1", txt)
             return txt
         if isinstance(n, c_ast.ID):
+            renamed_dummy = self.procedure_dummy_renames.get(n.name.lower())
+            if renamed_dummy is not None:
+                return renamed_dummy
             if n.name == "NULL":
                 return "0"
             if n.name == "RAND_MAX":
@@ -1532,8 +1568,13 @@ class Emitter:
         if isinstance(n, c_ast.UnaryOp):
             op = n.op
             if op == "sizeof":
-                # Size information is typically consumed in malloc/realloc byte counts.
-                # Keep lowering conservative for now.
+                # Preserve element counts in the common C idiom
+                # `sizeof(array) / sizeof(array[0])`.  Element byte sizes remain
+                # normalized to one, so the quotient becomes size(array).
+                if isinstance(n.expr, c_ast.ID):
+                    info = self.var_infos.get(n.expr.name.lower())
+                    if info is not None and info.shape:
+                        return f"size({self.expr(n.expr)})"
                 return "1"
             if op == "&":
                 return self.expr(n.expr)
@@ -1562,6 +1603,8 @@ class Emitter:
                 if self._is_alloc_entity(n.expr):
                     return f"(.not. allocated({self.expr(n.expr)}))"
                 if isinstance(n.expr, c_ast.ID):
+                    if n.expr.name.lower() in self.nonnullable_pointer_names:
+                        return ".false."
                     return self.simp(f"({self.expr(n.expr)} == 0)")
                 if (
                     isinstance(n.expr, c_ast.FuncCall)
@@ -1601,6 +1644,17 @@ class Emitter:
                         and other.name == "NULL"
                         and isinstance(side, c_ast.ID)
                         and side.name.lower() in self.pointer_like_names
+                    ):
+                        return ".false." if op == "==" else ".true."
+                # Procedure and scalar pointer dummies are lowered to required
+                # non-pointer Fortran dummies, so a successful call cannot pass
+                # a NULL actual argument.
+                for side, other in ((n.left, n.right), (n.right, n.left)):
+                    if (
+                        isinstance(other, c_ast.ID)
+                        and other.name == "NULL"
+                        and isinstance(side, c_ast.ID)
+                        and side.name.lower() in self.nonnullable_pointer_names
                     ):
                         return ".false." if op == "==" else ".true."
                 # A NULL char* is modeled as the one-char NUL sentinel string.
@@ -1744,7 +1798,15 @@ class Emitter:
             fname = self.expr(n.name)
             # `&arr[i]` (array decay) passed where the callee expects an array
             # becomes an array section `arr(i+1:)` rather than a scalar element.
-            if isinstance(n.name, c_ast.ID) and n.name.name in self.array_param_funcs and n.args is not None:
+            if (
+                isinstance(n.name, c_ast.ID)
+                and n.args is not None
+                and n.name.name.lower() not in self.procedure_dummy_renames
+                and (
+                    n.name.name in self.array_param_funcs
+                    or n.name.name in self.func_param_ftypes
+                )
+            ):
                 lowered = self._lower_call_args(n.name.name, n.args.exprs)
                 return f"{n.name.name}({', '.join(lowered)})"
             # _Generic type-selection macro: pick the branch for the argument's
@@ -2850,7 +2912,14 @@ class Emitter:
                         return
                     flat_values = self._flatten_init_list(st.init)
                     real_target = info.ftype.lower().startswith("real")
-                    values = ", ".join(self._init_elem_expr(value, real_target) for value in flat_values)
+                    kind_match = re.search(
+                        r"kind\s*=\s*([a-z_]\w*)", info.ftype, re.IGNORECASE
+                    )
+                    kind_name = kind_match.group(1) if kind_match else "dp"
+                    values = ", ".join(
+                        self._init_elem_expr(value, real_target, kind_name)
+                        for value in flat_values
+                    )
                     shape = self._rename_ids_in_text(", ".join(info.shape))
                     if len(flat_values) == 1 and (len(info.shape) > 1 or info.shape[0] != "1"):
                         # C `= {0}` / `= {{0}}` zero-fills the whole array:
@@ -3721,6 +3790,8 @@ def emit_function(
         em.emit_stmt(fn.body, ret_name=None)
         em.emit("end program main")
         em.pointer_like_names.clear()
+        em.nonnullable_pointer_names.clear()
+        em.procedure_dummy_renames = {}
         em.char_string_names.clear()
         em.id_rename = {}
         em.argv_name = None
@@ -3759,13 +3830,37 @@ def emit_function(
         _has_r, has_w = _scan_dummy_usage(fn.body, p.name)
         if has_w:
             copy_in_params[p.name] = f"{p.name}_arg"
+    funcptr_dummy_names: Dict[str, str] = {}
+    funcptr_dummy_ifaces: Dict[str, str] = {}
+    taken_param_names = {p.name.lower() for p in params if p.name}
+    for idx, p in enumerate(params):
+        if not p.name or not _is_funcptr_param(p):
+            continue
+        iface = em.func_ptr_ifaces.get((name, idx))
+        if iface is None:
+            continue
+        funcptr_dummy_ifaces[p.name] = iface
+        if iface.lower() != p.name.lower():
+            continue
+        renamed = f"{p.name}_proc"
+        while renamed.lower() in taken_param_names:
+            renamed += "_"
+        taken_param_names.add(renamed.lower())
+        funcptr_dummy_names[p.name] = renamed
+        em.procedure_dummy_renames[p.name.lower()] = renamed
+        em.id_rename[p.name] = renamed
+        em.alias_map[p.name.lower()] = renamed
     pnames: List[str] = []
     for idx, p in enumerate(params):
         if out_idx is not None and idx == out_idx:
             out_c_param_name = p.name
             out_param_name = p.name
             continue
-        pnames.append(copy_in_params.get(p.name, p.name))
+        pnames.append(
+            copy_in_params.get(
+                p.name, funcptr_dummy_names.get(p.name, p.name)
+            )
+        )
 
     result_name_for_body: Optional[str] = None
     result_decl_ftype: Optional[str] = None
@@ -3858,11 +3953,13 @@ def emit_function(
         if out_idx is not None and idx == out_idx:
             continue
         if _is_funcptr_param(p):
-            iface = em.func_ptr_ifaces.get((name, idx))
+            iface = funcptr_dummy_ifaces.get(p.name)
             if iface is not None:
                 # C function-pointer parameter: a dummy procedure with the
                 # interface of a function actually passed at some call site.
-                em.emit(f"procedure({iface}) :: {p.name}")
+                dummy_name = funcptr_dummy_names.get(p.name, p.name)
+                em.emit(f"procedure({iface}) :: {dummy_name}")
+                em.nonnullable_pointer_names.add(p.name.lower())
                 continue
         if isinstance(p.type, c_ast.PtrDecl):
             pf_ptr, _ = c_to_ftype(p.type)
@@ -3900,6 +3997,13 @@ def emit_function(
             else:
                 intent = "intent(in)"
         is_array_dummy = idx in em.array_param_funcs.get(name, set())
+        if (
+            p_ptr_or_arr
+            and not is_array_dummy
+            and _classify_char_decl(p.type) is None
+            and not p_ft.lower().startswith("type(")
+        ):
+            em.nonnullable_pointer_names.add(p.name.lower())
         # A non-const pointer to a struct is conventionally mutated by the
         # callee (its members are updated in place, often via address-of-member
         # passed to a helper). Usage scanning cannot see those indirect writes,
@@ -4044,6 +4148,8 @@ def emit_function(
     em.pointer_return_result_name = None
     em.fscanf_iostat_name = None
     em.pointer_like_names.clear()
+    em.nonnullable_pointer_names.clear()
+    em.procedure_dummy_renames = {}
     em.char_string_names.clear()
     em.id_rename = {}
     em.alias_map = {}
@@ -4365,6 +4471,10 @@ def transpile_c_to_fortran(
             continue
         fdecl = ext.decl.type
         fparams = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)] if fdecl.args else []
+        em.func_param_ftypes[ext.decl.name] = [
+            None if _is_funcptr_param(p) else c_to_ftype(p.type)[0]
+            for p in fparams
+        ]
         idxs = {
             idx for idx, p in enumerate(fparams)
             if p.name and type_is_ptr_or_array(p.type) and has_array_ref_of(ext.body, p.name)
@@ -5659,6 +5769,38 @@ def _unit_has_procedure_dummy(lines: List[str], start_idx: int) -> bool:
     return False
 
 
+def expand_c_file_arguments(items: List[Path]) -> Tuple[List[Path], List[str]]:
+    """Expand C-file glob arguments on shells that do not expand them."""
+    expanded: List[Path] = []
+    unmatched: List[str] = []
+    seen: Set[str] = set()
+
+    for item in items:
+        raw = str(item)
+        has_glob = any(char in raw for char in "*?[]")
+        candidates = [Path(match) for match in glob.glob(raw, recursive=True)] if has_glob else [item]
+        candidates = sorted(candidates, key=lambda path: str(path).lower())
+        matching_files = [
+            path
+            for path in candidates
+            if path.is_file() and path.suffix.lower() == ".c"
+        ]
+        if not matching_files:
+            unmatched.append(raw)
+            continue
+        for path in matching_files:
+            try:
+                key = str(path.resolve()).lower()
+            except OSError:
+                key = str(path.absolute()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(path)
+
+    return expanded, unmatched
+
+
 def inline_single_use_temp_assignments(lines: List[str]) -> List[str]:
     """Inline very-local temp assignments used once in the immediate next statement.
 
@@ -5826,6 +5968,11 @@ def main() -> int:
     ap.add_argument("--time-both", action="store_true", help="With --run-both, time both executables and report speed ratio")
     ap.add_argument("--maxfail", type=int, default=None, help="Stop after N cases where C builds but generated Fortran does not")
     args = ap.parse_args()
+    args.c_files, unmatched_inputs = expand_c_file_arguments(args.c_files)
+    if unmatched_inputs:
+        for unmatched in unmatched_inputs:
+            print(f"No C files matched: {unmatched}")
+        return 2
     if args.run_diff or args.time_both:
         args.run_both = True
     action_flags = [
