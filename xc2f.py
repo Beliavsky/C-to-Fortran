@@ -1290,6 +1290,27 @@ class Emitter:
         # changes (for example: ss/(n-1) must not become ss/n-1).
         return expr.strip()
 
+    def _array_index_expr(self, node: c_ast.Node) -> str:
+        """Render an integer array index without redundant arithmetic grouping."""
+        rendered = self.expr(node)
+        simplified = fscan.simplify_redundant_parens_in_line(
+            f"c2f_index = {rendered}\n"
+        )
+        return simplified.split("=", 1)[1].strip()
+
+    def _one_based_array_index_expr(self, node: c_ast.Node) -> str:
+        """Render a C index adjusted to Fortran's one-based indexing."""
+        if (
+            isinstance(node, c_ast.BinaryOp)
+            and node.op == "-"
+            and isinstance(node.right, c_ast.Constant)
+            and self._normalize_int_literal(node.right.value) == "1"
+        ):
+            return self._array_index_expr(node.left)
+        rendered = self._array_index_expr(node)
+        separator = " + 1" if isinstance(node, c_ast.BinaryOp) else "+1"
+        return f"{rendered}{separator}"
+
     def cond_expr(self, n: c_ast.Node) -> str:
         """Lower a C condition to a scalar Fortran logical expression."""
         if isinstance(n, c_ast.BinaryOp) and n.op in {"&&", "||"}:
@@ -1747,8 +1768,8 @@ class Emitter:
             # Indexing a scalar C string reads one character: use a substring.
             if isinstance(n.name, c_ast.ID) and n.name.name.lower() in self.char_string_names:
                 base = n.name.name
-                idx_txt = self.expr(n.subscript)
-                return f"{base}(({idx_txt})+1:({idx_txt})+1)"
+                idx_txt = self._one_based_array_index_expr(n.subscript)
+                return f"{base}({idx_txt}:{idx_txt})"
             # C multidimensional arrays are row-major. Reverse both dimensions
             # and subscripts in Fortran so a flat initializer retains its order.
             indices: List[c_ast.Node] = []
@@ -1758,7 +1779,7 @@ class Emitter:
                 base_node = base_node.name
             if len(indices) > 1:
                 base = self.expr(base_node)
-                rendered = [f"{self.expr(index)}+1" for index in indices]
+                rendered = [self._one_based_array_index_expr(index) for index in indices]
                 return f"{base}({', '.join(rendered)})"
             idx = n.subscript
             # C pointer indexing: (a + off)[i] => a(off + i + 1)
@@ -1783,8 +1804,8 @@ class Emitter:
                     return f"{sec_base}(({sec_off}) + ({self.expr(idx.expr)})+1)"
                 return f"{sec_base}(({sec_off}) + ({self.expr(idx)})+1)"
             if isinstance(idx, c_ast.UnaryOp) and idx.op == "p++":
-                return f"{name}({self.expr(idx.expr)}+1)"
-            return f"{name}({self.expr(idx)}+1)"
+                return f"{name}({self._one_based_array_index_expr(idx.expr)})"
+            return f"{name}({self._one_based_array_index_expr(idx)})"
         if isinstance(n, c_ast.FuncCall):
             # ops[i](args): call through a function-pointer array element.
             if (

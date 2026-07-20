@@ -1576,6 +1576,7 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
             lhs_rel = fscan.strip_redundant_outer_parens_expr(lhs_rel)
             rhs_rel = fscan.strip_redundant_outer_parens_expr(rhs_rel)
             value = f"{lhs_rel} {op_rel} {rhs_rel}"
+        value = _strip_simple_parenthesized_sections(value)
         value = _rewrite_safe_mul_self_to_pow2(value)
         return _rewrite_exp_linear_times_same(value)
 
