@@ -1,9 +1,10 @@
 # C-to-Fortran
 
-`C-to-Fortran` is an experimental source-to-source transpiler for a practical
-subset of C. It translates C source into readable free-form Fortran, with
-post-processing passes that simplify expressions, infer Fortran declarations,
-promote eligible procedures to `pure`, and use idiomatic one-based loops when
+`C-to-Fortran` is an experimental source-to-source transpiler for a
+practical subset of C, written using Codex and Claude. It translates C
+source into readable free-form Fortran, with post-processing passes
+that simplify expressions, infer Fortran declarations, promote
+eligible procedures to `pure`, and use idiomatic one-based loops when
 that transformation is safe.
 
 The project is under active development. It is useful for translating and
