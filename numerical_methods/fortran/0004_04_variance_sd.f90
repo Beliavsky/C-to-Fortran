@@ -2,8 +2,7 @@
 module kind_mod
 implicit none
 private
-public :: sp, dp
-integer, parameter :: sp = kind(1.0)
+public :: dp
 integer, parameter :: dp = kind(1.0d0)
 end module kind_mod
 

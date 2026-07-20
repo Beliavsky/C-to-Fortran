@@ -16,6 +16,33 @@ def test_gfortran_stops_after_first_compile_error() -> None:
     assert "-Wfatal-errors" in xc2f.DEFAULT_GFORTRAN_FLAGS
 
 
+def test_kind_module_omits_unused_single_precision_kind() -> None:
+    fortran = transpile_main("double x = 1.0; printf(\"%f\\n\", x);")
+    kind_module = fortran.split("module kind_mod", 1)[1].split(
+        "end module kind_mod", 1
+    )[0]
+
+    assert "public :: dp" in kind_module
+    assert "parameter :: dp" in kind_module
+    assert "public :: sp" not in kind_module
+    assert "parameter :: sp" not in kind_module
+
+
+def test_kind_module_keeps_used_single_precision_kind() -> None:
+    source = """
+    float identity(float x) { return x; }
+    int main(void) { return 0; }
+    """
+
+    fortran = xc2f.transpile_c_to_fortran(source)
+    kind_module = fortran.split("module kind_mod", 1)[1].split(
+        "end module kind_mod", 1
+    )[0]
+
+    assert "public :: sp" in kind_module
+    assert "parameter :: sp = kind(1.0)" in kind_module
+
+
 def test_debug_gfortran_flags_enable_full_runtime_diagnostics() -> None:
     normal = xc2f.gfortran_flags()
     debug = xc2f.gfortran_flags(debug=True)

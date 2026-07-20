@@ -5221,10 +5221,10 @@ def _time_executable(exe_path: Path, *, label: str, reps: int = 3) -> Optional[f
 
 
 def apply_shared_kind_module_dp(text: str, *, dp_init: str = "kind(1.0d0)") -> str:
-    """Use a shared kind_mod(sp,dp) when generated code needs kind constants.
+    """Use a shared ``kind_mod`` when generated code needs kind constants.
 
     Rewrites generated code to:
-    - add module kind_mod with dp parameter
+    - add module kind_mod with only the required sp/dp parameters
     - replace kind=real64 with kind=dp
     - replace/remove direct iso_fortran_env(real64) USE lines
     """
@@ -5286,12 +5286,13 @@ def apply_shared_kind_module_dp(text: str, *, dp_init: str = "kind(1.0d0)") -> s
         "module kind_mod\n",
         "implicit none\n",
         "private\n",
-        "public :: sp, dp\n",
-        "integer, parameter :: sp = kind(1.0)\n",
-        f"integer, parameter :: dp = {dp_init}\n",
-        "end module kind_mod\n",
-        "\n",
+        f"public :: {', '.join(use_syms)}\n",
     ]
+    if wants_sp:
+        kind_mod_block.append("integer, parameter :: sp = kind(1.0)\n")
+    if wants_dp:
+        kind_mod_block.append(f"integer, parameter :: dp = {dp_init}\n")
+    kind_mod_block.extend(["end module kind_mod\n", "\n"])
     lines = kind_mod_block + lines
     return "".join(lines)
 
