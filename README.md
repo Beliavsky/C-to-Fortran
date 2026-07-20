@@ -11,8 +11,6 @@ studying small numerical programs, but it is not a complete implementation of
 the C language. Generated code should be reviewed and tested before production
 use.
 
-Repository: <https://github.com/Beliavsky/C-to-Fortran>
-
 ## Requirements
 
 - Python 3.10 or newer
@@ -185,7 +183,3 @@ pytest -q -m corpus
 - Legacy K&R C sources may require an older dialect such as `-std=gnu89` when
   compiled with a recent GCC.
 
-## License
-
-No license has been selected yet. Add a `LICENSE` file before publishing if
-you want to grant others permission to copy, modify, or redistribute the code.
