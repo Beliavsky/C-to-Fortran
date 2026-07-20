@@ -362,6 +362,19 @@ def test_isfinite_uses_ieee_intrinsic() -> None:
     assert "ieee_is_finite(" in fortran
 
 
+def test_isnan_condition_uses_logical_ieee_intrinsic() -> None:
+    fortran = transpile_main(
+        "double value = 1.0; if (isnan(value)) return 1; "
+        "if (!isnan(value)) return 0;"
+    )
+
+    assert "only: ieee_is_nan" in fortran
+    assert "if (ieee_is_nan(xvalue)) stop" in fortran
+    assert "if (.not. (ieee_is_nan(xvalue))) stop" in fortran
+    assert "ieee_is_nan(xvalue) /= 0" not in fortran
+    assert "ieee_is_nan(xvalue) == 0" not in fortran
+
+
 def test_logical_not_of_integer_function_compares_with_zero() -> None:
     source = """
     int succeeds(void) { return 1; }

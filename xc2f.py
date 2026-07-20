@@ -1326,7 +1326,22 @@ class Emitter:
             return self.simp(self.expr(n))
         if isinstance(n, c_ast.UnaryOp) and n.op == "!":
             return self.simp(self.expr(n))
+        if self._is_logical_expr(n):
+            return self.simp(self.expr(n))
         return self.simp(f"({self.expr(n)} /= 0)")
+
+    @staticmethod
+    def _is_logical_expr(n: c_ast.Node) -> bool:
+        """Return whether ``n`` lowers directly to a Fortran LOGICAL value."""
+        if isinstance(n, c_ast.BinaryOp):
+            return n.op in {"==", "!=", "<", "<=", ">", ">=", "&&", "||"}
+        if isinstance(n, c_ast.UnaryOp):
+            return n.op == "!"
+        return (
+            isinstance(n, c_ast.FuncCall)
+            and isinstance(n.name, c_ast.ID)
+            and n.name.name.lower() in {"isfinite", "isnan"}
+        )
 
     @classmethod
     def _integer_constant_text(cls, node: c_ast.Node) -> Optional[str]:
@@ -1631,11 +1646,7 @@ class Emitter:
                     if n.expr.name.lower() in self.nonnullable_pointer_names:
                         return ".false."
                     return self.simp(f"({self.expr(n.expr)} == 0)")
-                if (
-                    isinstance(n.expr, c_ast.FuncCall)
-                    and isinstance(n.expr.name, c_ast.ID)
-                    and n.expr.name.name == "isfinite"
-                ):
+                if self._is_logical_expr(n.expr):
                     return self.simp(f".not. ({self.expr(n.expr)})")
                 if isinstance(n.expr, c_ast.BinaryOp) and n.expr.op in {
                     "==", "!=", "<", "<=", ">", ">=", "&&", "||"
@@ -1850,6 +1861,8 @@ class Emitter:
                 return self.simp(f"abs({args[0]})")
             if fname == "isfinite" and len(args) == 1:
                 return f"ieee_is_finite({args[0]})"
+            if fname == "isnan" and len(args) == 1:
+                return f"ieee_is_nan({args[0]})"
             if fname == "feof" and self.fscanf_iostat_name is not None:
                 return f"merge(1, 0, {self.fscanf_iostat_name} < 0)"
             if fname == "strlen" and len(args) == 1:
@@ -3745,12 +3758,15 @@ def emit_function(
         params = [p for p in fdecl.args.params if isinstance(p, c_ast.Decl)]
     need_ieee_consts = ast_uses_any_id(fn.body, {"NAN", "INFINITY", "HUGE_VAL"})
     need_ieee_finite = bool(collect_called_names(fn.body, {"isfinite"}))
+    need_ieee_nan = bool(collect_called_names(fn.body, {"isnan"}))
     need_fscanf_status = bool(collect_called_names(fn.body, {"fscanf"}))
     ieee_imports: List[str] = []
     if need_ieee_consts:
         ieee_imports.extend(["ieee_value", "ieee_quiet_nan", "ieee_positive_inf"])
     if need_ieee_finite:
         ieee_imports.append("ieee_is_finite")
+    if need_ieee_nan:
+        ieee_imports.append("ieee_is_nan")
     is_recursive = name in collect_called_names(fn.body, {name})
 
     need_int64 = ast_uses_any_id(fn.body, {"UINT_MAX", "LONG_MAX"}) or _body_has_unsigned_locals(fn.body)
